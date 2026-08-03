@@ -13,6 +13,12 @@ const BUF_BGID: u16 = 1;
 const IORING_CQE_F_BUFFER: u32 = 1 << 0;
 const IORING_CQE_BUFFER_SHIFT: u32 = 16;
 
+const TAG_HTTP_SEND: u64 = 0x01;
+const TAG_RECV_MULTI: u64 = 0x02;
+const TAG_DISK_WRITE_BASE: u64 = 0x100;
+
+const NUM_WRITE_BUFS: usize = 16;
+
 pub struct DownloadEngine {
     ring: IoUring,
     buf_size: usize,
@@ -101,7 +107,7 @@ impl DownloadEngine {
             (*tail_ptr).store(self.ring_entries, Ordering::Release);
         }
 
-        // 3. Send HTTP GET Request
+        // 3. Send HTTP GET Request via io_uring
         let http_req = url.build_get_request();
         let send_sqe = opcode::Write::new(
             types::Fd(sock_fd.as_raw_fd()),
@@ -109,13 +115,13 @@ impl DownloadEngine {
             http_req.len() as u32,
         )
         .build()
-        .user_data(0x01);
+        .user_data(TAG_HTTP_SEND);
 
         unsafe {
             self.ring.submission().push(&send_sqe).map_err(|e| anyhow!("SQ full: {}", e))?;
         }
         self.ring.submit_and_wait(1)?;
-        
+
         let send_cqe = self.ring.completion().next().ok_or_else(|| anyhow!("No CQE received for HTTP send"))?;
         if send_cqe.result() < 0 {
             return Err(anyhow!("Failed to send HTTP GET request: errno {}", -send_cqe.result()));
@@ -123,34 +129,107 @@ impl DownloadEngine {
 
         println!("✅ HTTP GET request sent. Arming multishot io_uring receive engine...");
 
-        // 4. Arm Multishot RECV SQE (1 syscall to arm persistent multishot receive)
+        // 4. Arm Multishot RECV SQE
         self.arm_recv_multishot(sock_fd.as_raw_fd())?;
 
-        // 5. Active Receive Loop (Batched O_DIRECT Engine)
+        // 5. Setup Async Ping-Pong Write Buffers (16 x 64KB page-aligned buffers)
+        let mut write_bufs: Vec<AlignedBuffer> = Vec::with_capacity(NUM_WRITE_BUFS);
+        for _ in 0..NUM_WRITE_BUFS {
+            write_bufs.push(AlignedBuffer::new(self.block_size, SECTOR_SIZE)?);
+        }
+        let mut buf_busy = [false; NUM_WRITE_BUFS];
+        let mut active_idx: usize = 0;
+        let mut active_fill: usize = 0;
+        let mut in_flight_writes: usize = 0;
+
         let mut header_parsed = false;
         let mut header_accumulator: Vec<u8> = Vec::with_capacity(8192);
         let mut writer: Option<DirectFileWriter> = None;
         let mut total_downloaded_bytes: u64 = 0;
         let mut expected_content_length: Option<u64> = None;
 
-        // Page-aligned block aggregator buffer (e.g. 64KB or 128KB)
-        let mut block_buf = AlignedBuffer::new(self.block_size, SECTOR_SIZE)?;
-        let mut block_fill: usize = 0;
-
         let tail_atomic = unsafe { &*tail_ptr };
 
-        println!("⚡ Receiving payload via provided buffer ring (Batched O_DIRECT)...");
+        // Buffer queue for network RECV chunks pending disk write buffer availability
+        let mut pending_chunks: Vec<Vec<u8>> = Vec::new();
+        let mut pending_bids: Vec<u16> = Vec::new();
+
+        println!("⚡ Pure io_uring Central Event Loop Active (State-Machine Backpressure Engine)...");
 
         loop {
-            self.ring.submit_and_wait(1)?;
-            
+            if self.ring.completion().is_empty() {
+                self.ring.submit_and_wait(1)?;
+            }
+
             let cqes: Vec<(u64, i32, u32)> = self.ring
                 .completion()
                 .map(|cqe| (cqe.user_data(), cqe.result(), cqe.flags()))
                 .collect();
 
+            // First pass: Process disk write completions to free up busy write buffers
+            for (user_data, res, _) in &cqes {
+                if *user_data >= TAG_DISK_WRITE_BASE && *user_data < TAG_DISK_WRITE_BASE + NUM_WRITE_BUFS as u64 {
+                    let buf_idx = (*user_data - TAG_DISK_WRITE_BASE) as usize;
+                    if *res < 0 {
+                        return Err(anyhow!("io_uring O_DIRECT disk write failed for buf {} with errno {}", buf_idx, -*res));
+                    }
+                    if buf_busy[buf_idx] {
+                        buf_busy[buf_idx] = false;
+                        if in_flight_writes > 0 {
+                            in_flight_writes -= 1;
+                        }
+                    }
+                }
+            }
+
+            // Flush any pending payload chunks that were backpressured earlier
+            if !pending_chunks.is_empty() && writer.is_some() {
+                let mut i = 0;
+                while i < pending_chunks.len() {
+                    if buf_busy[active_idx] {
+                        // Find next free write buffer
+                        let mut found = false;
+                        for b in 0..NUM_WRITE_BUFS {
+                            let next = (active_idx + b) % NUM_WRITE_BUFS;
+                            if !buf_busy[next] {
+                                active_idx = next;
+                                found = true;
+                                break;
+                            }
+                        }
+                        if !found { break; }
+                    }
+
+                    let chunk = &pending_chunks[i];
+                    let (new_idx, new_fill, wrote) = self.append_to_block_buf(
+                        writer.as_mut().unwrap(),
+                        &mut write_bufs,
+                        &mut buf_busy,
+                        active_idx,
+                        active_fill,
+                        chunk,
+                    )?;
+                    active_idx = new_idx;
+                    active_fill = new_fill;
+                    if wrote { in_flight_writes += 1; }
+
+                    let bid = pending_bids[i];
+                    let buf_offset = bid as usize * self.buf_size;
+                    let buf_ptr = unsafe { raw_buf_pool.as_mut_slice().as_mut_ptr().add(buf_offset) };
+                    buf_ring_slice[bid as usize].set_addr(buf_ptr as u64);
+                    buf_ring_slice[bid as usize].set_len(self.buf_size as u32);
+                    buf_ring_slice[bid as usize].set_bid(bid);
+                    tail_atomic.fetch_add(1, Ordering::Release);
+
+                    i += 1;
+                }
+                pending_chunks.drain(0..i);
+                pending_bids.drain(0..i);
+            }
+
+            // Second pass: Process network receive completions
             for (user_data, res, flags) in cqes {
-                if user_data == 0x02 { // Multishot RECV completion
+                if user_data == TAG_RECV_MULTI {
                     if res <= 0 {
                         if res == -libc::ENOBUFS {
                             self.arm_recv_multishot(sock_fd.as_raw_fd())?;
@@ -163,10 +242,28 @@ impl DownloadEngine {
                             eprintln!("\nRECV completion ended with result: {}", res);
                         }
 
+                        // Flush trailing active buffer
                         if let Some(ref mut w) = writer {
-                            if block_fill > 0 {
-                                self.flush_block(w, &block_buf, block_fill)?;
-                                block_fill = 0;
+                            if active_fill > 0 && !buf_busy[active_idx] {
+                                self.submit_async_disk_write(w, &write_bufs[active_idx], active_fill, active_idx)?;
+                                buf_busy[active_idx] = true;
+                                in_flight_writes += 1;
+                                active_fill = 0;
+                            }
+                        }
+
+                        // Drain remaining in-flight disk writes safely
+                        while in_flight_writes > 0 {
+                            self.ring.submit_and_wait(1)?;
+                            for cqe in self.ring.completion() {
+                                let tag = cqe.user_data();
+                                if tag >= TAG_DISK_WRITE_BASE && tag < TAG_DISK_WRITE_BASE + NUM_WRITE_BUFS as u64 {
+                                    let idx = (tag - TAG_DISK_WRITE_BASE) as usize;
+                                    if buf_busy[idx] {
+                                        buf_busy[idx] = false;
+                                        in_flight_writes -= 1;
+                                    }
+                                }
                             }
                         }
                         return Ok(());
@@ -199,29 +296,64 @@ impl DownloadEngine {
                                 let initial_payload = &header_accumulator[payload_start..];
                                 if !initial_payload.is_empty() {
                                     total_downloaded_bytes += initial_payload.len() as u64;
-                                    block_fill = self.append_and_flush(
+                                    let (new_idx, new_fill, wrote) = self.append_to_block_buf(
                                         writer.as_mut().unwrap(),
-                                        &mut block_buf,
-                                        block_fill,
+                                        &mut write_bufs,
+                                        &mut buf_busy,
+                                        active_idx,
+                                        active_fill,
                                         initial_payload,
                                     )?;
+                                    active_idx = new_idx;
+                                    active_fill = new_fill;
+                                    if wrote { in_flight_writes += 1; }
                                 }
                             }
+                            // Return buffer back to kernel
+                            buf_ring_slice[bid as usize].set_addr(buf_ptr as u64);
+                            buf_ring_slice[bid as usize].set_len(self.buf_size as u32);
+                            buf_ring_slice[bid as usize].set_bid(bid);
+                            tail_atomic.fetch_add(1, Ordering::Release);
                         } else {
                             total_downloaded_bytes += bytes_read as u64;
-                            block_fill = self.append_and_flush(
+                            
+                            // Check if write buffer pool is temporarily full
+                            if buf_busy[active_idx] {
+                                let mut found = false;
+                                for b in 0..NUM_WRITE_BUFS {
+                                    let next = (active_idx + b) % NUM_WRITE_BUFS;
+                                    if !buf_busy[next] {
+                                        active_idx = next;
+                                        found = true;
+                                        break;
+                                    }
+                                }
+                                if !found {
+                                    // Queue payload chunk until disk write CQEs free up write buffers
+                                    pending_chunks.push(recv_buf_slice.to_vec());
+                                    pending_bids.push(bid);
+                                    continue;
+                                }
+                            }
+
+                            let (new_idx, new_fill, wrote) = self.append_to_block_buf(
                                 writer.as_mut().unwrap(),
-                                &mut block_buf,
-                                block_fill,
+                                &mut write_bufs,
+                                &mut buf_busy,
+                                active_idx,
+                                active_fill,
                                 recv_buf_slice,
                             )?;
-                        }
+                            active_idx = new_idx;
+                            active_fill = new_fill;
+                            if wrote { in_flight_writes += 1; }
 
-                        // Return buffer back to kernel io_uring_buf_ring
-                        buf_ring_slice[bid as usize].set_addr(buf_ptr as u64);
-                        buf_ring_slice[bid as usize].set_len(self.buf_size as u32);
-                        buf_ring_slice[bid as usize].set_bid(bid);
-                        tail_atomic.fetch_add(1, Ordering::Release);
+                            // Return buffer back to kernel
+                            buf_ring_slice[bid as usize].set_addr(buf_ptr as u64);
+                            buf_ring_slice[bid as usize].set_len(self.buf_size as u32);
+                            buf_ring_slice[bid as usize].set_bid(bid);
+                            tail_atomic.fetch_add(1, Ordering::Release);
+                        }
                     }
 
                     // Progress reporting
@@ -230,12 +362,29 @@ impl DownloadEngine {
                         print!("\rProgress: {} / {} bytes ({:.2}%)", total_downloaded_bytes, total, pct);
                         use std::io::Write;
                         let _ = std::io::stdout().flush();
+
                         if total_downloaded_bytes >= total {
                             println!("\n🎉 Download complete!");
                             if let Some(ref mut w) = writer {
-                                if block_fill > 0 {
-                                    self.flush_block(w, &block_buf, block_fill)?;
-                                    block_fill = 0;
+                                if active_fill > 0 && !buf_busy[active_idx] {
+                                    self.submit_async_disk_write(w, &write_bufs[active_idx], active_fill, active_idx)?;
+                                    buf_busy[active_idx] = true;
+                                    in_flight_writes += 1;
+                                    active_fill = 0;
+                                }
+                            }
+                            // Drain remaining disk write SQEs
+                            while in_flight_writes > 0 {
+                                self.ring.submit_and_wait(1)?;
+                                for cqe in self.ring.completion() {
+                                    let tag = cqe.user_data();
+                                    if tag >= TAG_DISK_WRITE_BASE && tag < TAG_DISK_WRITE_BASE + NUM_WRITE_BUFS as u64 {
+                                        let idx = (tag - TAG_DISK_WRITE_BASE) as usize;
+                                        if buf_busy[idx] {
+                                            buf_busy[idx] = false;
+                                            in_flight_writes -= 1;
+                                        }
+                                    }
                                 }
                             }
                             return Ok(());
@@ -249,7 +398,7 @@ impl DownloadEngine {
     fn arm_recv_multishot(&mut self, sock_fd: i32) -> Result<()> {
         let recv_sqe = opcode::RecvMulti::new(types::Fd(sock_fd), BUF_BGID)
             .build()
-            .user_data(0x02);
+            .user_data(TAG_RECV_MULTI);
 
         unsafe {
             self.ring.submission().push(&recv_sqe).map_err(|e| anyhow!("SQ full: {}", e))?;
@@ -258,52 +407,62 @@ impl DownloadEngine {
         Ok(())
     }
 
-    fn append_and_flush(
+    fn append_to_block_buf(
         &mut self,
         writer: &mut DirectFileWriter,
-        block_buf: &mut AlignedBuffer,
+        write_bufs: &mut [AlignedBuffer],
+        buf_busy: &mut [bool; NUM_WRITE_BUFS],
+        mut active_idx: usize,
         mut current_fill: usize,
         data: &[u8],
-    ) -> Result<usize> {
+    ) -> Result<(usize, usize, bool)> {
         let mut offset = 0;
+        let mut wrote = false;
+
         while offset < data.len() {
             let space_left = self.block_size - current_fill;
             let to_copy = std::cmp::min(space_left, data.len() - offset);
 
-            block_buf.as_mut_slice()[current_fill..current_fill + to_copy]
+            write_bufs[active_idx].as_mut_slice()[current_fill..current_fill + to_copy]
                 .copy_from_slice(&data[offset..offset + to_copy]);
 
             current_fill += to_copy;
             offset += to_copy;
 
             if current_fill == self.block_size {
-                self.flush_block(writer, block_buf, self.block_size)?;
+                self.submit_async_disk_write(writer, &write_bufs[active_idx], self.block_size, active_idx)?;
+                buf_busy[active_idx] = true;
+                wrote = true;
+
+                active_idx = (active_idx + 1) % NUM_WRITE_BUFS;
                 current_fill = 0;
             }
         }
-        Ok(current_fill)
+        Ok((active_idx, current_fill, wrote))
     }
 
-    fn flush_block(
+    fn submit_async_disk_write(
         &mut self,
         writer: &mut DirectFileWriter,
-        block_buf: &AlignedBuffer,
+        buf: &AlignedBuffer,
         fill_size: usize,
+        buf_idx: usize,
     ) -> Result<()> {
         let write_len = (fill_size + SECTOR_SIZE - 1) & !(SECTOR_SIZE - 1);
-        
-        let written = unsafe {
-            libc::pwrite(
-                writer.raw_fd(),
-                block_buf.as_slice().as_ptr() as *const libc::c_void,
-                write_len,
-                writer.current_offset() as libc::off_t,
-            )
-        };
 
-        if written < 0 {
-            return Err(anyhow!("O_DIRECT pwrite failed: errno {}", std::io::Error::last_os_error()));
+        let write_sqe = opcode::Write::new(
+            types::Fd(writer.raw_fd()),
+            buf.as_slice().as_ptr(),
+            write_len as u32,
+        )
+        .offset(writer.current_offset())
+        .build()
+        .user_data(TAG_DISK_WRITE_BASE + buf_idx as u64);
+
+        unsafe {
+            self.ring.submission().push(&write_sqe).map_err(|e| anyhow!("SQ full on write: {}", e))?;
         }
+        self.ring.submit()?;
 
         writer.advance_offset(fill_size as u64);
 
