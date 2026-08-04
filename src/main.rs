@@ -29,8 +29,8 @@ pub struct Cli {
     #[arg(long, default_value_t = 128)]
     pub ring_entries: u16,
 
-    /// Buffer size per entry in bytes (default: 131072 - 128 KiB)
-    #[arg(long, default_value_t = 131072)]
+    /// Buffer size per entry in bytes (default: 1048576 - 1 MiB)
+    #[arg(long, default_value_t = 1048576)]
     pub buf_size: usize,
 }
 
