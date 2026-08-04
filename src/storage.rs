@@ -8,7 +8,7 @@ use std::path::Path;
 
 pub const SECTOR_SIZE: usize = 4096;
 
-/// Page-aligned memory buffer for O_DIRECT writes
+/// Page-aligned memory buffer for DMA and io_uring operations
 pub struct AlignedBuffer {
     ptr: *mut u8,
     layout: Layout,
@@ -43,7 +43,7 @@ impl Drop for AlignedBuffer {
     }
 }
 
-/// O_DIRECT File writer with disk space pre-allocation
+/// Standard File writer matching aria2c page-cache model with disk space pre-allocation
 pub struct DirectFileWriter {
     raw_fd: RawFd,
     _file: File,
@@ -52,11 +52,12 @@ pub struct DirectFileWriter {
 
 impl DirectFileWriter {
     pub fn create<P: AsRef<Path>>(path: P, content_length: Option<u64>) -> Result<Self> {
-        let oflags = OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_TRUNC | OFlag::O_DIRECT;
+        // Standard buffered page cache file write (level field with aria2c)
+        let oflags = OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_TRUNC;
         let mode = Mode::S_IRUSR | Mode::S_IWUSR | Mode::S_IRGRP | Mode::S_IROTH;
 
         let fd = open(path.as_ref(), oflags, mode)
-            .map_err(|e| anyhow!("Failed to open file {:?} with O_DIRECT: {}", path.as_ref(), e))?;
+            .map_err(|e| anyhow!("Failed to open file {:?}: {}", path.as_ref(), e))?;
 
         let _file = unsafe { File::from_raw_fd(fd) };
 
