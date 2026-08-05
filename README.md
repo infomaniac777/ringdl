@@ -34,7 +34,7 @@ Instead of copying data into user-space buffers or executing traditional POSIX `
    * Destination disk space is pre-allocated immediately using `posix_fallocate` (`O_RDWR | O_CREAT | O_TRUNC`) to prevent filesystem fragmentation during high-speed writes.
 2. **In-Kernel Splice Loop (`IORING_OP_SPLICE`)**:
    * Once headers are parsed, `ringdl` transitions into a pure kernel-space pipeline.
-   * **`TAG_SPLICE_IN`**: The kernel pipe is configured with a payload capacity of **1 MB** (`F_SETPIPE_SZ = 1048576`). Under the hood, the kernel translates this into a ring buffer of 256 page pointers (256 × 4 KiB = 1 MB). When this SQE runs, it transfers up to 256 page pointers directly from the socket's receive queue into the pipe. **Zero payload bytes are copied or moved in physical memory.**
+   * **`TAG_SPLICE_IN`**: The kernel pipe is configured with a payload capacity of **1 MB** (`F_SETPIPE_SZ = 1048576`). Under the hood, the kernel translates this into a ring buffer of 256 page pointers (256 × 4 KB = 1 MB). When this SQE runs, it transfers up to 256 page pointers directly from the socket's receive queue into the pipe. **Zero payload bytes are copied or moved in physical memory.**
    * **`TAG_SPLICE_OUT`**: Slices those exact pipe pages directly into the destination file's inode address space.
    * **EAGAIN / EINTR Handling**: Transparently catches `-libc::EAGAIN`, `-libc::EWOULDBLOCK`, and `-libc::EINTR` returns from `io_uring`, re-submitting SQEs without dropping connections or spinning CPU cycles.
 
@@ -74,7 +74,25 @@ We evaluated three architectures during development: **`O_DIRECT`**, **Page Cach
 
 ---
 
-## 4. 5 GB Ethernet Simulation Benchmark
+## 4. Intentional Trade-offs & Design Philosophy
+
+`ringdl` abandons traditional cross-platform compatibility and user-space control to build an ultra-specialized Linux dragster. We explicitly accepted the following trade-offs:
+
+### 4.1 Linux-Native by Design
+`aria2c` and `curl` compile on Windows, macOS, and Linux by relying on POSIX `read/write` loops. `ringdl` strictly requires **Linux 5.19+**. We shed POSIX portability entirely to leverage bleeding-edge kernel primitives.
+
+### 4.2 No Application-Layer Hashing
+Because payload bytes never enter user space, `ringdl` cannot compute on-the-fly SHA-256 hashes or inspect data for malware. We consider this redundant for transport integrity: modern **TLS AEAD** (AES-GCM / ChaCha20-Poly1305) provides cryptographically secure transport integrity, and TCP/Ethernet CRCs protect against hardware bit-flips. File-level verification can be handled out-of-band by the user post-download.
+
+### 4.3 Why We Avoid `SQPOLL`
+While `io_uring` offers a mode called `SQPOLL` (Submission Queue Polling) to achieve truly zero syscalls, it requires dedicating a kernel thread to spin-poll a CPU core at 100% usage. For a downloader running on standard hardware, burning a whole CPU core to save a few microseconds is a terrible trade. `ringdl` relies on the standard `io_uring_enter` syscall to batch SQEs, cutting the traditional POSIX syscall tax in half while letting threads sleep efficiently during network latency.
+
+### 4.4 The Fixed Pipe Pool (Solving Kernel Memory Scaling)
+Dedicating a 1 MB kernel pipe to every single TCP connection would cause massive kernel memory pressure (`fs.pipe-max-size`) at 10,000+ connections. Because `ringdl` fully empties the pipe in every `TAG_SPLICE_OUT` operation, pipes are completely stateless between cycles. This allows us to use a **global fixed pool of pipes** (e.g., 16 pipes shared across all connections), permanently capping kernel memory consumption regardless of scale.
+
+---
+
+## 5. 5 GB Ethernet Simulation Benchmark
 
 Benchmark results for a 5.00 GB (`5,368,709,120` bytes) download over HTTP (`127.0.0.1:8085` / `nginx`), measured using `/usr/bin/time -v`:
 
@@ -94,7 +112,7 @@ Benchmark results for a 5.00 GB (`5,368,709,120` bytes) download over HTTP (`127
 
 ---
 
-## 5. Usage & CLI Options
+## 6. Usage & CLI Options
 
 ```bash
 # Build release binary
@@ -116,7 +134,7 @@ target/release/ringdl --buf-size 524288 http://example.com/largefile.zip -o ./la
 
 ---
 
-## 6. Future Architecture: Zero-Copy HTTPS via Kernel TLS (`kTLS`)
+## 7. Future Architecture: Zero-Copy HTTPS via Kernel TLS (`kTLS`)
 
 Normally, downloading over HTTPS/TLS destroys zero-copy pipelines because cryptographic decryption requires reading ciphertext into user-space RAM, running decryption algorithms in CPU registers, and copying decrypted plaintext back out to disk.
 
@@ -150,7 +168,7 @@ Normally, downloading over HTTPS/TLS destroys zero-copy pipelines because crypto
 +-----------------------------------------------------------------------------------+
 ```
 
-### 6.1 The 3-Phase kTLS Execution Plan
+### 7.1 The 3-Phase kTLS Execution Plan
 1. **Phase 1 — Control-Plane Handshake (`rustls` / `ktls`)**:
    * The client connects to `https://host:443` and performs the initial TLS 1.2 / 1.3 certificate verification and Diffie-Hellman handshake in user space using `rustls` (restricted to kTLS-compatible AES-GCM and ChaCha20-Poly1305 cipher suites).
 2. **Phase 2 — Kernel Key Handoff (`SOL_TLS` / `TLS_RX`)**:
@@ -162,13 +180,13 @@ Normally, downloading over HTTPS/TLS destroys zero-copy pipelines because crypto
 
 ---
 
-## 7. General Project Roadmap
+## 8. General Project Roadmap
 
 1. **kTLS HTTPS/1.1 Engine Integration**:
    * Integrate `ktls` crate with `DownloadEngine` for zero-copy HTTPS downloading.
-2. **Multi-Connection HTTP Range Splicing**:
+2. **Pipe Pool Implementation**:
+   * Replace the 1-to-1 connection/pipe mapping with a global pool of pre-allocated pipes to bound kernel memory usage at scale.
+3. **Multi-Connection HTTP Range Splicing**:
    * Open multiple concurrent TCP sockets within the single `IoUring` instance and splice HTTP Range chunks simultaneously into the same pre-allocated disk file.
-3. **IPv6 Support**:
+4. **IPv6 Support**:
    * Extend TCP socket resolution in `engine.rs` to handle `SocketAddr::V6`.
-4. **Dynamic Pipe Capacity Auto-Tuning**:
-   * Auto-detect `/proc/sys/fs/pipe-max-size` limits at startup to maximize `F_SETPIPE_SZ` without manual configuration.
