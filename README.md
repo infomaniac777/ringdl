@@ -134,11 +134,11 @@ target/release/ringdl --buf-size 524288 http://example.com/largefile.zip -o ./la
 
 ---
 
-## 7. Future Architecture: Zero-Copy HTTPS via Kernel TLS (`kTLS`)
+## 7. Zero-Copy HTTPS via Kernel TLS (`kTLS`)
 
 Normally, downloading over HTTPS/TLS destroys zero-copy pipelines because cryptographic decryption requires reading ciphertext into user-space RAM, running decryption algorithms in CPU registers, and copying decrypted plaintext back out to disk.
 
-`ringdl` will solve this by integrating **Linux Kernel TLS (`kTLS` — Linux 4.13+ / 5.2+ / 6.x)** with our `IORING_OP_SPLICE` engine, enabling **100% in-kernel zero-copy HTTPS downloading**:
+`ringdl` solves this by integrating **Linux Kernel TLS (`kTLS` — Linux 4.13+ / 5.2+ / 6.x)** with our `IORING_OP_SPLICE` engine, enabling **100% in-kernel zero-copy HTTPS downloading**:
 
 ```
 +-----------------------------------------------------------------------------------+
@@ -182,9 +182,7 @@ Normally, downloading over HTTPS/TLS destroys zero-copy pipelines because crypto
 
 ## 8. General Project Roadmap
 
-1. **kTLS HTTPS/1.1 Engine Integration**:
-   * Integrate `ktls` crate with `DownloadEngine` for zero-copy HTTPS downloading.
-2. **Pipe Pool Implementation**:
+1. **Pipe Pool Implementation**:
    * Replace the 1-to-1 connection/pipe mapping with a global pool of pre-allocated pipes to bound kernel memory usage at scale.
 3. **Multi-Connection HTTP Range Splicing**:
    * Open multiple concurrent TCP sockets within the single `IoUring` instance and splice HTTP Range chunks simultaneously into the same pre-allocated disk file.
