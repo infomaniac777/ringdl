@@ -92,7 +92,9 @@ Dedicating a 1 MB kernel pipe to every single TCP connection would cause massive
 
 ---
 
-## 5. 5 GB Ethernet Simulation Benchmark
+## 5. Benchmarks
+
+### 5.1 5 GB HTTP Ethernet Simulation Benchmark
 
 Benchmark results for a 5.00 GB (`5,368,709,120` bytes) download over HTTP (`127.0.0.1:8085` / `nginx`), measured using `/usr/bin/time -v`:
 
@@ -109,6 +111,35 @@ Benchmark results for a 5.00 GB (`5,368,709,120` bytes) download over HTTP (`127
 1. **Total CPU Efficiency**: Completes a 5 GB download using only **2.21s–2.43s** of total CPU time compared to **2.72s** for `aria2c`.
 2. **Zero User-Space Overhead**: Uses only **0.05s** of User CPU time (>90% reduction) and **162 minor page faults** (**99.99% reduction**), because zero payload bytes are mapped or copied in user space.
 3. **Minimal Memory Footprint**: Runs in just **2.42 MB** of RAM compared to **17.07 MB** for `aria2c`.
+
+### 5.2 1 GB HTTPS In-Kernel Decryption Benchmark
+
+Benchmark results for a 1.00 GB download over **HTTPS** (in-kernel TLS decryption), measured using `/usr/bin/time -v` on a single TCP connection.
+
+* **Target URL**: `https://fsn1-speed.hetzner.com/1GB.bin`
+* **ringdl Git Hash**: `8a889d7`
+
+**Commands to replicate:**
+```bash
+# aria2c
+/usr/bin/time -v aria2c -x 1 -s 1 --disable-ipv6=true -o aria2_1GB.bin https://fsn1-speed.hetzner.com/1GB.bin
+
+# ringdl
+cargo build --release
+/usr/bin/time -v target/release/ringdl https://fsn1-speed.hetzner.com/1GB.bin -o ringdl_1GB.bin
+```
+
+| Metric | `aria2c` (1 GB HTTPS) | `ringdl` (kTLS + `splice`) | **Improvement vs. `aria2c`** |
+| :--- | :--- | :--- | :--- |
+| **Elapsed (Wall) Time** | 3m 06s | **2m 58s** | **Slightly faster** |
+| **User CPU Time (s)** | 3.36s | **0.46s** | **86.3% FASTER** (`3.36s` -> `0.46s`) |
+| **System (Kernel) CPU Time (s)** | 4.72s | **4.78s** | **Identical** |
+| **Total CPU Time (User+Sys)** | **8.08s** | **5.24s** | **35.1% FASTER TOTAL CPU** |
+| **Max RSS Memory (KB)** | 18,248 KB | **6,188 KB** | **66.1% LESS RAM** (`18.2 MB` -> `6.1 MB`) |
+| **Minor Page Faults** | 243,303 | **486** | **99.8% FEWER PAGE FAULTS** |
+
+**Why `ringdl` crushed the HTTPS test:**
+By offloading TLS decryption to the Linux Kernel (`kTLS`), `ringdl` bypassed the standard user-space cryptographic cost. `aria2c` spent **3.36s** in User Time performing AES decryption. `ringdl` spent just **0.46s** in User Time. Even though `ringdl` added the AES decryption burden to the Kernel (System Time), its System Time (4.78s) was nearly identical to `aria2c` (4.72s) because `ringdl` eliminated the thousands of `read()`/`write()` syscalls that `aria2c` requires!
 
 ---
 
