@@ -17,7 +17,7 @@ Instead of copying data into user-space buffers or executing traditional POSIX `
 |                                                                                   |
 |  +--------------------+                         +------------------------------+  |
 |  |  TCP Socket        | --(1. TAG_SPLICE_IN)--> |  Kernel Pipe (pipe2)         |  |
-|  |  Receive Queue     |                         |  (1 MiB Buffer Capacity)     |  |
+|  |  Receive Queue     |                         |  (1 MB Buffer Capacity)      |  |
 |  +--------------------+                         +------------------------------+  |
 |                                                                |                  |
 |                                                     (2. TAG_SPLICE_OUT)           |
@@ -34,7 +34,7 @@ Instead of copying data into user-space buffers or executing traditional POSIX `
    * Destination disk space is pre-allocated immediately using `posix_fallocate` (`O_RDWR | O_CREAT | O_TRUNC`) to prevent filesystem fragmentation during high-speed writes.
 2. **In-Kernel Splice Loop (`IORING_OP_SPLICE`)**:
    * Once headers are parsed, `ringdl` transitions into a pure kernel-space pipeline.
-   * **`TAG_SPLICE_IN`**: Moves up to **1 MiB** (`1048576` bytes) of TCP payload from the socket receive queue into a kernel pipe (`pipe2` with `F_SETPIPE_SZ`).
+   * **`TAG_SPLICE_IN`**: The kernel pipe is configured with a payload capacity of **1 MB** (`F_SETPIPE_SZ = 1048576`). Under the hood, the kernel translates this into a ring buffer of 256 page pointers (256 × 4 KiB = 1 MB). When this SQE runs, it transfers up to 256 page pointers directly from the socket's receive queue into the pipe. **Zero payload bytes are copied or moved in physical memory.**
    * **`TAG_SPLICE_OUT`**: Slices those exact pipe pages directly into the destination file's inode address space.
    * **EAGAIN / EINTR Handling**: Transparently catches `-libc::EAGAIN`, `-libc::EWOULDBLOCK`, and `-libc::EINTR` returns from `io_uring`, re-submitting SQEs without dropping connections or spinning CPU cycles.
 
@@ -76,9 +76,9 @@ We evaluated three architectures during development: **`O_DIRECT`**, **Page Cach
 
 ## 4. 5 GB Ethernet Simulation Benchmark
 
-Benchmark results for a 5.00 GiB (`5,368,709,120` bytes) download over HTTP (`127.0.0.1:8085` / `nginx`), measured using `/usr/bin/time -v`:
+Benchmark results for a 5.00 GB (`5,368,709,120` bytes) download over HTTP (`127.0.0.1:8085` / `nginx`), measured using `/usr/bin/time -v`:
 
-| Metric | `aria2c` (5 GB) | `ringdl` (1 MiB In-Kernel `IORING_OP_SPLICE`) | **Improvement vs. `aria2c`** |
+| Metric | `aria2c` (5 GB) | `ringdl` (1 MB In-Kernel `IORING_OP_SPLICE`) | **Improvement vs. `aria2c`** |
 | :--- | :--- | :--- | :--- |
 | **User CPU Time (s)** | 0.56s | **0.05s** | **91.1% FASTER** (`0.56s` -> `0.05s`) |
 | **System (Kernel) CPU Time (s)** | 2.16s | **2.13s – 2.38s** | **COMPETITIVE / FASTER** |
@@ -88,7 +88,7 @@ Benchmark results for a 5.00 GiB (`5,368,709,120` bytes) download over HTTP (`12
 | **File Verification (`cmp`)** | `Identical` | **`100% Byte-for-Byte Identical`** | **Verified** |
 
 ### Why `ringdl` Dominates
-1. **Total CPU Efficiency**: Completes a 5 GiB download using only **2.21s–2.43s** of total CPU time compared to **2.72s** for `aria2c`.
+1. **Total CPU Efficiency**: Completes a 5 GB download using only **2.21s–2.43s** of total CPU time compared to **2.72s** for `aria2c`.
 2. **Zero User-Space Overhead**: Uses only **0.05s** of User CPU time (>90% reduction) and **162 minor page faults** (**99.99% reduction**), because zero payload bytes are mapped or copied in user space.
 3. **Minimal Memory Footprint**: Runs in just **2.42 MB** of RAM compared to **17.07 MB** for `aria2c`.
 
@@ -100,7 +100,7 @@ Benchmark results for a 5.00 GiB (`5,368,709,120` bytes) download over HTTP (`12
 # Build release binary
 cargo build --release
 
-# Download a file (defaults to 1 MiB splice buffer capacity)
+# Download a file (defaults to 1 MB splice buffer capacity)
 target/release/ringdl http://127.0.0.1:8085/test_5gb.bin -o ./downloaded_file.bin
 
 # Customize splice buffer chunk size (in bytes)
@@ -110,9 +110,9 @@ target/release/ringdl --buf-size 524288 http://example.com/largefile.zip -o ./la
 ### Command-Line Arguments (`src/main.rs`)
 * `url` (required): Target HTTP URL to download.
 * `-o, --output <PATH>`: Output file path (defaults to filename from URL path).
-* `--buf-size <BYTES>`: Maximum splice chunk size per transaction (default: `1048576` - 1 MiB).
+* `--buf-size <BYTES>`: Maximum splice chunk size per transaction (default: `1048576` - 1 MB).
 * `--ring-entries <ENTRIES>`: Number of CQ/SQ completion ring entries (default: `128`).
-* `--block-size-kb <KIB>`: Sector block size in KiB (default: `64`).
+* `--block-size-kb <KIB>`: Sector block size in KB (default: `64`).
 
 ---
 
@@ -138,7 +138,7 @@ Normally, downloading over HTTPS/TLS destroys zero-copy pipelines because crypto
 |                                                                                   |
 |    +--------------------+       1. Decrypts TLS        +-----------------------+  |
 |    | TCP Socket         | --- (tls_sw_splice_read) --> | Kernel Pipe (pipe2)   |  |
-|    | Receive Queue      |       via TAG_SPLICE_IN      | (1 MiB Plaintext)     |  |
+|    | Receive Queue      |       via TAG_SPLICE_IN      | (1 MB Plaintext)      |  |
 |    +--------------------+                              +-----------------------+  |
 |                                                                    |              |
 |                                                              TAG_SPLICE_OUT       |
