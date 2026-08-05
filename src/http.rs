@@ -3,6 +3,7 @@ use url::Url;
 
 #[derive(Debug, Clone)]
 pub struct ParsedUrl {
+    pub scheme: String,
     pub host: String,
     pub port: u16,
     pub path: String,
@@ -11,18 +12,19 @@ pub struct ParsedUrl {
 impl ParsedUrl {
     pub fn parse(input: &str) -> Result<Self> {
         let url = Url::parse(input)?;
-        if url.scheme() != "http" {
-            return Err(anyhow!("Only plain HTTP is supported in MVP (got scheme: {})", url.scheme()));
+        let scheme = url.scheme().to_string();
+        if scheme != "http" && scheme != "https" {
+            return Err(anyhow!("Only HTTP and HTTPS are supported (got scheme: {})", scheme));
         }
         let host = url.host_str().ok_or_else(|| anyhow!("Missing host in URL"))?.to_string();
-        let port = url.port_or_known_default().unwrap_or(80);
+        let port = url.port_or_known_default().unwrap_or(if scheme == "https" { 443 } else { 80 });
         let path = if let Some(query) = url.query() {
             format!("{}?{}", url.path(), query)
         } else {
             url.path().to_string()
         };
 
-        Ok(Self { host, port, path })
+        Ok(Self { scheme, host, port, path })
     }
 
     pub fn build_get_request(&self) -> String {

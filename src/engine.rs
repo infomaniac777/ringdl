@@ -3,7 +3,9 @@ use io_uring::{opcode, types, IoUring};
 use nix::sys::socket::{connect, socket, AddressFamily, SockFlag, SockType, SockaddrIn};
 use std::io::Write;
 use std::net::ToSocketAddrs;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::sync::Arc;
+use rustls::{ClientConfig, RootCertStore};
 use std::path::Path;
 
 use crate::http::{parse_http_response_header, ParsedUrl};
@@ -55,6 +57,41 @@ impl DownloadEngine {
             Ok(_) => {},
             Err(nix::errno::Errno::EINPROGRESS) => {},
             Err(e) => return Err(anyhow!("Socket connection failed: {}", e)),
+        }
+
+        if url.scheme == "https" {
+            println!("🔒 Performing TLS Handshake...");
+            let mut root_store = RootCertStore::empty();
+            for cert in rustls_native_certs::load_native_certs().certs {
+                let _ = root_store.add(cert);
+            }
+            let mut config = ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth();
+            config.enable_secret_extraction = true;
+            let config = Arc::new(config);
+
+            let server_name = rustls::pki_types::ServerName::try_from(url.host.clone())
+                .map_err(|e| anyhow!("Invalid DNS name for TLS: {:?}", e))?
+                .to_owned();
+
+            let std_stream = unsafe { std::net::TcpStream::from_raw_fd(sock_fd.as_raw_fd()) };
+            std_stream.set_nonblocking(true)?;
+
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+            
+            let ktls_stream = rt.block_on(async {
+                let tokio_stream = tokio::net::TcpStream::from_std(std_stream).map_err(|e| anyhow!("from_std failed: {}", e))?;
+                let corked_stream = ktls::CorkStream::new(tokio_stream);
+                let connector = tokio_rustls::TlsConnector::from(config);
+                let tls_stream = connector.connect(server_name, corked_stream).await.map_err(|e| anyhow!("TLS connect failed: {}", e))?;
+                println!("🚀 TLS Handshake complete. Offloading to Kernel TLS (kTLS)...");
+                ktls::config_ktls_client(tls_stream).await.map_err(|e| anyhow!("kTLS setup failed: {:?}", e))
+            })?;
+            
+            // We leak the ktls_stream to prevent Tokio from running Drop and closing the FD
+            std::mem::forget(ktls_stream);
+            println!("✅ kTLS successfully enabled. Socket is now transparently decrypted.");
         }
 
         // 2. Send HTTP GET Request via io_uring

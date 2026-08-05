@@ -13,3 +13,8 @@ libc = "0.2.161"
 url = "2.5.2"
 nix = { version = "0.29.0", features = ["fs", "socket", "net", "uio"] }
 anyhow = "1.0.90"
+rustls = "0.23.43"
+rustls-native-certs = "0.8.4"
+ktls = "6.0.2"
+tokio = { version = "1.53.1", features = ["rt", "net", "io-util"] }
+tokio-rustls = "0.26.4"
