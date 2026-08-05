@@ -178,13 +178,17 @@ Normally, downloading over HTTPS/TLS destroys zero-copy pipelines because crypto
    * When `IORING_OP_SPLICE` (`TAG_SPLICE_IN`) executes, the kernel decrypts TLS records on the wire (via NIC Hardware Offload or kernel `tls_sw`) and pipes **decrypted plaintext page references (`struct page *`)** directly into the kernel pipe.
    * Result: **HTTPS downloads run at the exact same 0.05s User CPU time and 162 page fault efficiency as plain HTTP.**
 
+### 7.2 The TLS 1.3 Post-Handshake Quirk (Why we force TLS 1.2)
+In TLS 1.3, servers often proactively send `NewSessionTicket` control records *after* the handshake is complete. When `kTLS` intercepts one of these non-Application Data records, it requires user space to fetch it via a `recvmsg` control buffer (`CMSG`). Because our `io_uring` `IORING_OP_SPLICE` loop operates entirely at the byte level without control buffers, encountering a post-handshake ticket causes the splice to crash with `-EIO`.
+To prevent this, `ringdl` currently restricts `rustls` to **TLS 1.2**. This forces all session tickets to be sent *during* the handshake (in user space), guaranteeing that the socket delivers 100% pure Application Data once `kTLS` and `splice()` take over. *(Note: We will review whether TLS 1.3 can be safely supported in the future without breaking the zero-copy pipeline).*
+
 ---
 
 ## 8. General Project Roadmap
 
 1. **Pipe Pool Implementation**:
    * Replace the 1-to-1 connection/pipe mapping with a global pool of pre-allocated pipes to bound kernel memory usage at scale.
-3. **Multi-Connection HTTP Range Splicing**:
+2. **Multi-Connection HTTP Range Splicing**:
    * Open multiple concurrent TCP sockets within the single `IoUring` instance and splice HTTP Range chunks simultaneously into the same pre-allocated disk file.
-4. **IPv6 Support**:
+3. **IPv6 Support**:
    * Extend TCP socket resolution in `engine.rs` to handle `SocketAddr::V6`.

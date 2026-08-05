@@ -65,7 +65,7 @@ impl DownloadEngine {
             for cert in rustls_native_certs::load_native_certs().certs {
                 let _ = root_store.add(cert);
             }
-            let mut config = ClientConfig::builder()
+            let mut config = ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS12])
                 .with_root_certificates(root_store)
                 .with_no_client_auth();
             config.enable_secret_extraction = true;
@@ -91,6 +91,7 @@ impl DownloadEngine {
             
             // We leak the ktls_stream to prevent Tokio from running Drop and closing the FD
             std::mem::forget(ktls_stream);
+            std::mem::forget(rt);
             println!("✅ kTLS successfully enabled. Socket is now transparently decrypted.");
         }
 
@@ -124,7 +125,7 @@ impl DownloadEngine {
         let mut total_downloaded_bytes: u64 = 0;
 
         loop {
-            let recv_sqe = opcode::Recv::new(
+            let read_sqe = opcode::Read::new(
                 types::Fd(sock_fd.as_raw_fd()),
                 unsafe { header_buf.as_mut_ptr().add(header_bytes_read) },
                 (header_buf.len() - header_bytes_read) as u32,
@@ -133,7 +134,7 @@ impl DownloadEngine {
             .user_data(0x10);
 
             unsafe {
-                self.ring.submission().push(&recv_sqe).map_err(|e| anyhow!("SQ full on header recv: {}", e))?;
+                self.ring.submission().push(&read_sqe).map_err(|e| anyhow!("SQ full on header recv: {}", e))?;
             }
             self.ring.submit_and_wait(1)?;
 
