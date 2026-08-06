@@ -62,7 +62,20 @@ pub fn parse_http_response_header(buf: &[u8]) -> Result<Option<HttpResponseHeade
             for header in resp.headers.iter() {
                 if header.name.eq_ignore_ascii_case("Content-Length") {
                     if let Ok(val_str) = std::str::from_utf8(header.value) {
-                        content_length = val_str.trim().parse::<u64>().ok();
+                        if content_length.is_none() {
+                            content_length = val_str.trim().parse::<u64>().ok();
+                        }
+                    }
+                }
+                if header.name.eq_ignore_ascii_case("Content-Range") {
+                    if let Ok(val_str) = std::str::from_utf8(header.value) {
+                        // format: bytes 0-0/104857600
+                        if let Some(slash_idx) = val_str.find('/') {
+                            let total_str = &val_str[slash_idx + 1..];
+                            if let Ok(total) = total_str.trim().parse::<u64>() {
+                                content_length = Some(total);
+                            }
+                        }
                     }
                 }
             }

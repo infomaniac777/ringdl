@@ -158,6 +158,7 @@ target/release/ringdl --buf-size 524288 http://example.com/largefile.zip -o ./la
 
 ### Command-Line Arguments (`src/main.rs`)
 * `url` (required): Target HTTP URL to download.
+* `-x, --connections <N>`: Number of concurrent HTTP Range connections (default: `16`).
 * `-o, --output <PATH>`: Output file path (defaults to filename from URL path).
 * `--buf-size <BYTES>`: Maximum splice chunk size per transaction (default: `1048576` - 1 MB).
 * `--ring-entries <ENTRIES>`: Number of CQ/SQ completion ring entries (default: `128`).
@@ -217,9 +218,14 @@ To prevent this, `ringdl` currently restricts `rustls` to **TLS 1.2**. This forc
 
 ## 8. General Project Roadmap
 
-1. **Pipe Pool Implementation**:
-   * Replace the 1-to-1 connection/pipe mapping with a global pool of pre-allocated pipes to bound kernel memory usage at scale.
-2. **Multi-Connection HTTP Range Splicing**:
-   * Open multiple concurrent TCP sockets within the single `IoUring` instance and splice HTTP Range chunks simultaneously into the same pre-allocated disk file.
-3. **IPv6 Support**:
+### 8.1 Completed
+1. **Multi-Connection HTTP Range Splicing**:
+   * Sockets are fully multiplexed into a single `io_uring` thread via a 5-stage async state machine, splicing HTTP Range chunks concurrently into the same pre-allocated disk file.
+2. **1-to-1 Kernel Pipe Mapping**:
+   * Replaced the proposed global pipe pool with a 1-to-1 Kernel Pipe per connection architecture. Because `ringdl` targets 16-64 connections, kernel memory is comfortably bounded (16 MB - 64 MB) without requiring complex cross-connection pipe pooling.
+
+### 8.2 Upcoming
+1. **IPv6 Support**:
    * Extend TCP socket resolution in `engine.rs` to handle `SocketAddr::V6`.
+2. **TLS 1.3 Support**:
+   * Investigate if TLS 1.3 `NewSessionTicket` control records can be safely bypassed or intercepted to allow upgrading from the current TLS 1.2 restriction.

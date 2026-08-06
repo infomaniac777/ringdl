@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use io_uring::{opcode, types, IoUring};
 use nix::sys::socket::{connect, socket, AddressFamily, SockFlag, SockType, SockaddrIn};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::ToSocketAddrs;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::sync::Arc;
@@ -10,18 +10,53 @@ use std::path::Path;
 
 use crate::http::{parse_http_response_header, ParsedUrl};
 use crate::storage::DirectFileWriter;
+use crate::pipe::KernelPipe;
 
-const TAG_HTTP_SEND: u64 = 0x01;
-const TAG_SPLICE_IN: u64 = 0x03;
-const TAG_SPLICE_OUT: u64 = 0x04;
+const STATE_SEND_REQ: u8 = 1;
+const STATE_READ_HEADER: u8 = 2;
+const STATE_WRITE_INITIAL: u8 = 3;
+const STATE_SPLICE_IN: u8 = 4;
+const STATE_SPLICE_OUT: u8 = 5;
+
+// Encode conn_id and state into u64 user_data
+fn encode_user_data(conn_id: usize, state: u8) -> u64 {
+    ((conn_id as u64) << 8) | (state as u64)
+}
+
+fn decode_user_data(user_data: u64) -> (usize, u8) {
+    let state = (user_data & 0xFF) as u8;
+    let conn_id = (user_data >> 8) as usize;
+    (conn_id, state)
+}
+
+struct ConnectionState {
+    id: usize,
+    sock_fd: i32,
+    pipe: KernelPipe,
+    file_offset: u64,
+    bytes_remaining: u64,
+    
+    // State machine buffers
+    header_buf: Vec<u8>,
+    header_bytes_read: usize,
+    initial_payload_len: usize,
+    current_pipe_bytes: u32,
+    
+    // HTTP Request string to keep in memory for io_uring
+    http_req: String,
+    
+    // Has this connection finished?
+    done: bool,
+}
 
 pub struct DownloadEngine {
     ring: IoUring,
     buf_size: usize,
+    connections: usize,
 }
 
 impl DownloadEngine {
-    pub fn new(ring_entries: u16, buf_size: usize, _block_size_kb: usize) -> Result<Self> {
+    pub fn new(ring_entries: u16, buf_size: usize, connections: usize, _block_size_kb: usize) -> Result<Self> {
         let ring = IoUring::builder()
             .setup_cqsize(ring_entries as u32 * 4)
             .build(ring_entries as u32 * 2)?;
@@ -29,196 +64,161 @@ impl DownloadEngine {
         Ok(Self {
             ring,
             buf_size,
+            connections,
         })
     }
-
-    pub fn download(&mut self, url: &ParsedUrl, output_path: &Path) -> Result<()> {
-        // 1. Resolve host and connect TCP socket
+    
+    fn setup_socket(url: &ParsedUrl) -> Result<i32> {
         let addr_str = format!("{}:{}", url.host, url.port);
         let socket_addr = addr_str
             .to_socket_addrs()?
             .next()
-            .ok_or_else(|| anyhow!("Failed to resolve IP address for host: {}", url.host))?;
+            .ok_or_else(|| anyhow!("Failed to resolve IP for host: {}", url.host))?;
 
-        let sock_fd = socket(
-            AddressFamily::Inet,
-            SockType::Stream,
-            SockFlag::SOCK_CLOEXEC,
-            None,
-        )?;
-
+        let sock_fd = socket(AddressFamily::Inet, SockType::Stream, SockFlag::SOCK_CLOEXEC, None)?;
         let sockaddr_in = match socket_addr {
             std::net::SocketAddr::V4(v4) => SockaddrIn::from(v4),
-            _ => return Err(anyhow!("IPv6 not supported in initial MVP")),
+            _ => return Err(anyhow!("IPv6 not supported in MVP")),
         };
 
-        println!("📡 Connecting to {} ({:?})...", url.host, socket_addr);
         match connect(sock_fd.as_raw_fd(), &sockaddr_in) {
-            Ok(_) => {},
-            Err(nix::errno::Errno::EINPROGRESS) => {},
+            Ok(_) | Err(nix::errno::Errno::EINPROGRESS) => {},
             Err(e) => return Err(anyhow!("Socket connection failed: {}", e)),
         }
+        Ok(std::os::fd::IntoRawFd::into_raw_fd(sock_fd))
+    }
 
-        if url.scheme == "https" {
-            println!("🔒 Performing TLS Handshake...");
-            let mut root_store = RootCertStore::empty();
-            for cert in rustls_native_certs::load_native_certs().certs {
-                let _ = root_store.add(cert);
+    fn setup_ktls(sock_fd: i32, url: &ParsedUrl, rt: &tokio::runtime::Runtime) -> Result<Box<dyn std::any::Any>> {
+        let mut root_store = RootCertStore::empty();
+        for cert in rustls_native_certs::load_native_certs().certs {
+            let _ = root_store.add(cert);
+        }
+        let mut config = ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS12])
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        config.enable_secret_extraction = true;
+        let config = Arc::new(config);
+
+        let server_name = rustls::pki_types::ServerName::try_from(url.host.clone())
+            .map_err(|e| anyhow!("Invalid DNS name for TLS: {:?}", e))?
+            .to_owned();
+
+        let std_stream = unsafe { std::net::TcpStream::from_raw_fd(sock_fd) };
+        std_stream.set_nonblocking(true)?;
+        
+        let ktls_stream = rt.block_on(async {
+            let tokio_stream = tokio::net::TcpStream::from_std(std_stream).map_err(|e| anyhow!("from_std failed: {}", e))?;
+            let corked_stream = ktls::CorkStream::new(tokio_stream);
+            let connector = tokio_rustls::TlsConnector::from(config);
+            let tls_stream = connector.connect(server_name, corked_stream).await.map_err(|e| anyhow!("TLS connect failed: {}", e))?;
+            ktls::config_ktls_client(tls_stream).await.map_err(|e| anyhow!("kTLS setup failed: {:?}", e))
+        })?;
+        
+        Ok(Box::new(ktls_stream))
+    }
+
+    fn get_file_info(url: &ParsedUrl) -> Result<u64> {
+        let sock_fd = Self::setup_socket(url)?;
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+        let _tls_guard = if url.scheme == "https" {
+            Some(Self::setup_ktls(sock_fd, url, &rt)?)
+        } else {
+            None
+        };
+        
+        let mut stream = unsafe { std::net::TcpStream::from_raw_fd(sock_fd) };
+        stream.set_nonblocking(false).map_err(|e| anyhow!("set_nonblocking failed: {}", e))?;
+        
+        let head_req = format!(
+            "GET {} HTTP/1.1\r\nHost: {}:{}\r\nUser-Agent: ringdl/0.1.0\r\nAccept: */*\r\nRange: bytes=0-0\r\nConnection: close\r\n\r\n",
+            url.path, url.host, url.port
+        );
+        stream.write_all(head_req.as_bytes()).map_err(|e| anyhow!("write_all failed: {}", e))?;
+        
+        let mut buf = vec![0; 8192];
+        let n = stream.read(&mut buf).map_err(|e| anyhow!("read failed: {}", e))?;
+        
+        println!("DEBUG HEAD RESPONSE: {}", String::from_utf8_lossy(&buf[..n]));
+        
+        if let Some(header) = parse_http_response_header(&buf[..n])? {
+            if let Some(len) = header.content_length {
+                return Ok(len);
             }
-            let mut config = ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS12])
-                .with_root_certificates(root_store)
-                .with_no_client_auth();
-            config.enable_secret_extraction = true;
-            let config = Arc::new(config);
+        }
+        
+        Err(anyhow!("Failed to extract Content-Length from HEAD request"))
+    }
 
-            let server_name = rustls::pki_types::ServerName::try_from(url.host.clone())
-                .map_err(|e| anyhow!("Invalid DNS name for TLS: {:?}", e))?
-                .to_owned();
+    pub fn download(&mut self, url: &ParsedUrl, output_path: &Path) -> Result<()> {
+        println!("📡 Pre-flight HEAD request to get file size...");
+        let total_size = Self::get_file_info(url)?;
+        println!("✨ Total file size: {} bytes", total_size);
 
-            let std_stream = unsafe { std::net::TcpStream::from_raw_fd(sock_fd.as_raw_fd()) };
-            std_stream.set_nonblocking(true)?;
+        let num_connections = self.connections.max(1);
+        let chunk_size = total_size / num_connections as u64;
 
-            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+        let w = DirectFileWriter::create(output_path, Some(total_size))?;
+        let writer_fd = w.raw_fd();
+        
+        let mut states = Vec::with_capacity(num_connections);
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+        let mut _tls_streams = Vec::with_capacity(num_connections);
+
+        println!("🚀 Spawning {} concurrent connections...", num_connections);
+        for id in 0..num_connections {
+            let start = id as u64 * chunk_size;
+            let end = if id == num_connections - 1 {
+                total_size - 1
+            } else {
+                start + chunk_size - 1
+            };
             
-            let ktls_stream = rt.block_on(async {
-                let tokio_stream = tokio::net::TcpStream::from_std(std_stream).map_err(|e| anyhow!("from_std failed: {}", e))?;
-                let corked_stream = ktls::CorkStream::new(tokio_stream);
-                let connector = tokio_rustls::TlsConnector::from(config);
-                let tls_stream = connector.connect(server_name, corked_stream).await.map_err(|e| anyhow!("TLS connect failed: {}", e))?;
-                println!("🚀 TLS Handshake complete. Offloading to Kernel TLS (kTLS)...");
-                ktls::config_ktls_client(tls_stream).await.map_err(|e| anyhow!("kTLS setup failed: {:?}", e))
-            })?;
+            let sock_fd = Self::setup_socket(url)?;
+            if url.scheme == "https" {
+                _tls_streams.push(Self::setup_ktls(sock_fd, url, &rt)?);
+            }
             
-            // We leak the ktls_stream to prevent Tokio from running Drop and closing the FD
-            std::mem::forget(ktls_stream);
-            std::mem::forget(rt);
-            println!("✅ kTLS successfully enabled. Socket is now transparently decrypted.");
+            let http_req = format!(
+                "GET {} HTTP/1.1\r\nHost: {}:{}\r\nUser-Agent: ringdl/0.1.0\r\nAccept: */*\r\nRange: bytes={}-{}\r\nConnection: close\r\n\r\n",
+                url.path, url.host, url.port, start, end
+            );
+            
+            let pipe = KernelPipe::new()?;
+            
+            states.push(ConnectionState {
+                id,
+                sock_fd,
+                pipe,
+                file_offset: start,
+                bytes_remaining: end - start + 1,
+                header_buf: vec![0u8; 8192],
+                header_bytes_read: 0,
+                initial_payload_len: 0,
+                current_pipe_bytes: 0,
+                http_req,
+                done: false,
+            });
         }
+        
+        println!("⚡ Engaging io_uring Multi-Connection Data Plane...");
 
-        // 2. Send HTTP GET Request via io_uring
-        let http_req = url.build_get_request();
-        let send_sqe = opcode::Write::new(
-            types::Fd(sock_fd.as_raw_fd()),
-            http_req.as_ptr(),
-            http_req.len() as u32,
-        )
-        .build()
-        .user_data(TAG_HTTP_SEND);
-
-        unsafe {
-            self.ring.submission().push(&send_sqe).map_err(|e| anyhow!("SQ full: {}", e))?;
-        }
-        self.ring.submit_and_wait(1)?;
-
-        let send_cqe = self.ring.completion().next().ok_or_else(|| anyhow!("No CQE received for HTTP send"))?;
-        if send_cqe.result() < 0 {
-            return Err(anyhow!("Failed to send HTTP GET request: errno {}", -send_cqe.result()));
-        }
-
-        println!("✅ HTTP GET request sent. Reading HTTP response header...");
-
-        // 3. Read HTTP Response Header
-        let mut header_buf = vec![0u8; 8192];
-        let mut header_bytes_read = 0;
-        let mut expected_content_length: Option<u64> = None;
-        let mut writer: Option<DirectFileWriter> = None;
-        let mut total_downloaded_bytes: u64 = 0;
-
-        loop {
-            let read_sqe = opcode::Read::new(
-                types::Fd(sock_fd.as_raw_fd()),
-                unsafe { header_buf.as_mut_ptr().add(header_bytes_read) },
-                (header_buf.len() - header_bytes_read) as u32,
+        for state in states.iter() {
+            let sqe = opcode::Write::new(
+                types::Fd(state.sock_fd),
+                state.http_req.as_ptr(),
+                state.http_req.len() as u32,
             )
             .build()
-            .user_data(0x10);
-
-            unsafe {
-                self.ring.submission().push(&read_sqe).map_err(|e| anyhow!("SQ full on header recv: {}", e))?;
-            }
-            self.ring.submit_and_wait(1)?;
-
-            let cqe = self.ring.completion().next().ok_or_else(|| anyhow!("No CQE for header recv"))?;
-            let res = cqe.result();
-            if res <= 0 {
-                return Err(anyhow!("Connection closed or error while reading HTTP headers: res {}", res));
-            }
-
-            header_bytes_read += res as usize;
-
-            if let Some(header) = parse_http_response_header(&header_buf[..header_bytes_read])? {
-                println!(
-                    "✨ HTTP Header Received! Status: {}, Content-Length: {:?}",
-                    header.status_code,
-                    header.content_length.unwrap_or(0)
-                );
-                expected_content_length = header.content_length;
-                let header_len = header.header_len;
-
-                let mut w = DirectFileWriter::create(output_path, header.content_length)?;
-
-                let initial_payload = &header_buf[header_len..header_bytes_read];
-                if !initial_payload.is_empty() {
-                    let write_sqe = opcode::Write::new(
-                        types::Fd(w.raw_fd()),
-                        initial_payload.as_ptr(),
-                        initial_payload.len() as u32,
-                    )
-                    .offset(w.current_offset())
-                    .build()
-                    .user_data(0x20);
-
-                    unsafe {
-                        self.ring.submission().push(&write_sqe).map_err(|e| anyhow!("SQ full on initial write: {}", e))?;
-                    }
-                    self.ring.submit_and_wait(1)?;
-
-                    let w_cqe = self.ring.completion().next().ok_or_else(|| anyhow!("No CQE for initial payload write"))?;
-                    if w_cqe.result() < 0 {
-                        return Err(anyhow!("Failed to write initial payload: errno {}", -w_cqe.result()));
-                    }
-                    w.advance_offset(initial_payload.len() as u64);
-                    total_downloaded_bytes += initial_payload.len() as u64;
-                }
-
-                writer = Some(w);
-                break;
-            }
-
-            if header_bytes_read == header_buf.len() {
-                header_buf.resize(header_buf.len() * 2, 0);
-            }
+            .user_data(encode_user_data(state.id, STATE_SEND_REQ));
+            
+            unsafe { self.ring.submission().push(&sqe).map_err(|e| anyhow!("SQ full: {}", e))?; }
         }
+        self.ring.submit()?;
 
-        // 4. In-Kernel Zero-Copy (IORING_OP_SPLICE) Loop: TCP Socket -> Kernel Pipe -> File
-        let (pipe_r, pipe_w) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)?;
-        let mut pipe_capacity: usize = 1048576; // 1 MiB max pipe capacity
-        if nix::fcntl::fcntl(pipe_r.as_raw_fd(), nix::fcntl::FcntlArg::F_SETPIPE_SZ(pipe_capacity as libc::c_int)).is_err() {
-            pipe_capacity = 262144;
-            let _ = nix::fcntl::fcntl(pipe_r.as_raw_fd(), nix::fcntl::FcntlArg::F_SETPIPE_SZ(pipe_capacity as libc::c_int));
-        }
+        let mut active_connections = num_connections;
+        let mut total_downloaded_bytes: u64 = 0;
 
-        let splice_chunk = std::cmp::min(self.buf_size, pipe_capacity);
-
-        println!("⚡ Pure In-Kernel Zero-Copy (IORING_OP_SPLICE) Active: TCP Socket -> Kernel Pipe -> Filesystem...");
-
-        if let Some(total) = expected_content_length {
-            if total_downloaded_bytes >= total {
-                println!("\n🎉 Download complete!");
-                return Ok(());
-            }
-        }
-
-        let remaining_init = match expected_content_length {
-            Some(total) => (total - total_downloaded_bytes) as usize,
-            None => splice_chunk,
-        };
-        let first_len = std::cmp::min(splice_chunk, remaining_init);
-        self.submit_splice_in(sock_fd.as_raw_fd(), pipe_w.as_raw_fd(), first_len as u32)?;
-
-        let mut current_pipe_bytes: u32 = 0;
-
-        loop {
+        while active_connections > 0 {
             self.ring.submit_and_wait(1)?;
 
             let cqes: Vec<(u64, i32, u32)> = self.ring
@@ -227,109 +227,179 @@ impl DownloadEngine {
                 .collect();
 
             for (user_data, res, _) in cqes {
-                if user_data == TAG_SPLICE_IN {
-                    if res <= 0 {
-                        if res == -libc::EAGAIN || res == -libc::EWOULDBLOCK || res == -libc::EINTR {
-                            let remaining = match expected_content_length {
-                                Some(total) => (total - total_downloaded_bytes) as usize,
-                                None => splice_chunk,
-                            };
-                            let retry_len = std::cmp::min(splice_chunk, remaining);
-                            self.submit_splice_in(sock_fd.as_raw_fd(), pipe_w.as_raw_fd(), retry_len as u32)?;
-                            continue;
+                let (conn_id, state_id) = decode_user_data(user_data);
+                let mut state = &mut states[conn_id];
+                
+                if res < 0 {
+                    let err = -res;
+                    if err == libc::EAGAIN || err == libc::EWOULDBLOCK || err == libc::EINTR {
+                        match state_id {
+                            STATE_SEND_REQ => {
+                                let sqe = opcode::Write::new(
+                                    types::Fd(state.sock_fd),
+                                    state.http_req.as_ptr(),
+                                    state.http_req.len() as u32,
+                                ).build().user_data(user_data);
+                                unsafe { self.ring.submission().push(&sqe).map_err(|e| anyhow!("SQ full: {}", e))?; }
+                            }
+                            STATE_READ_HEADER => {
+                                let sqe = opcode::Read::new(
+                                    types::Fd(state.sock_fd),
+                                    unsafe { state.header_buf.as_mut_ptr().add(state.header_bytes_read) },
+                                    (state.header_buf.len() - state.header_bytes_read) as u32,
+                                ).build().user_data(user_data);
+                                unsafe { self.ring.submission().push(&sqe).map_err(|e| anyhow!("SQ full: {}", e))?; }
+                            }
+                            STATE_SPLICE_IN => {
+                                let next_chunk = std::cmp::min(self.buf_size, state.bytes_remaining as usize);
+                                let next_chunk = std::cmp::min(next_chunk, state.pipe.capacity);
+                                let sqe = opcode::Splice::new(
+                                    types::Fd(state.sock_fd), -1,
+                                    types::Fd(state.pipe.write_fd.as_raw_fd()), -1,
+                                    next_chunk as u32,
+                                ).build().user_data(user_data);
+                                unsafe { self.ring.submission().push(&sqe).map_err(|e| anyhow!("SQ full: {}", e))?; }
+                            }
+                            STATE_SPLICE_OUT => {
+                                let sqe = opcode::Splice::new(
+                                    types::Fd(state.pipe.read_fd.as_raw_fd()), -1,
+                                    types::Fd(writer_fd), state.file_offset as i64,
+                                    state.current_pipe_bytes,
+                                ).build().user_data(user_data);
+                                unsafe { self.ring.submission().push(&sqe).map_err(|e| anyhow!("SQ full: {}", e))?; }
+                            }
+                            _ => {}
                         }
-                        if res == 0 {
-                            println!("\nEOF reached on SPLICE_IN.");
-                            return Ok(());
-                        }
-                        return Err(anyhow!("IORING_OP_SPLICE socket -> pipe failed: errno {}", -res));
+                        continue;
                     }
-                    current_pipe_bytes = res as u32;
-                    let w = writer.as_ref().unwrap();
-                    self.submit_splice_out(
-                        pipe_r.as_raw_fd(),
-                        w.raw_fd(),
-                        w.current_offset(),
-                        current_pipe_bytes,
-                    )?;
-                } else if user_data == TAG_SPLICE_OUT {
-                    if res <= 0 {
-                        if res == -libc::EAGAIN || res == -libc::EWOULDBLOCK || res == -libc::EINTR {
-                            let w = writer.as_ref().unwrap();
-                            self.submit_splice_out(
-                                pipe_r.as_raw_fd(),
-                                w.raw_fd(),
-                                w.current_offset(),
-                                current_pipe_bytes,
-                            )?;
-                            continue;
+                    if err == libc::ECONNRESET && state.bytes_remaining == 0 {
+                        if !state.done {
+                            state.done = true;
+                            active_connections -= 1;
                         }
-                        return Err(anyhow!("IORING_OP_SPLICE pipe -> file failed: errno {}", -res));
-                    }
-                    let bytes_written = res as u64;
-                    let w = writer.as_mut().unwrap();
-                    w.advance_offset(bytes_written);
-                    total_downloaded_bytes += bytes_written;
-
-                    if let Some(total) = expected_content_length {
-                        let pct = (total_downloaded_bytes as f64 / total as f64) * 100.0;
-                        print!("\rProgress: {} / {} bytes ({:.2}%)", total_downloaded_bytes, total, pct);
-                        let _ = std::io::stdout().flush();
-
-                        if total_downloaded_bytes >= total {
-                            println!("\n🎉 Download complete via In-Kernel Zero-Copy (splice)!");
-                            return Ok(());
-                        }
-                    }
-
-                    let remaining = match expected_content_length {
-                        Some(total) => (total - total_downloaded_bytes) as usize,
-                        None => splice_chunk,
-                    };
-                    let next_chunk = std::cmp::min(splice_chunk, remaining);
-                    if next_chunk > 0 {
-                        self.submit_splice_in(sock_fd.as_raw_fd(), pipe_w.as_raw_fd(), next_chunk as u32)?;
+                        continue;
                     } else {
-                        return Ok(());
+                        return Err(anyhow!("io_uring error on conn {} state {}: errno {}", conn_id, state_id, err));
                     }
                 }
+                
+                if res == 0 && state_id != STATE_SEND_REQ && state_id != STATE_WRITE_INITIAL {
+                    if !state.done {
+                        state.done = true;
+                        active_connections -= 1;
+                    }
+                    continue;
+                }
+
+                match state_id {
+                    STATE_SEND_REQ => {
+                        let sqe = opcode::Read::new(
+                            types::Fd(state.sock_fd),
+                            unsafe { state.header_buf.as_mut_ptr().add(state.header_bytes_read) },
+                            (state.header_buf.len() - state.header_bytes_read) as u32,
+                        ).build().user_data(encode_user_data(conn_id, STATE_READ_HEADER));
+                        unsafe { self.ring.submission().push(&sqe).map_err(|e| anyhow!("SQ full: {}", e))?; }
+                    }
+                    STATE_READ_HEADER => {
+                        state.header_bytes_read += res as usize;
+                        if let Some(header) = parse_http_response_header(&state.header_buf[..state.header_bytes_read])? {
+                            let initial_payload = &state.header_buf[header.header_len..state.header_bytes_read];
+                            state.initial_payload_len = initial_payload.len();
+                            
+                            if !initial_payload.is_empty() {
+                                let sqe = opcode::Write::new(
+                                    types::Fd(writer_fd),
+                                    initial_payload.as_ptr(),
+                                    initial_payload.len() as u32,
+                                ).offset(state.file_offset as u64).build().user_data(encode_user_data(conn_id, STATE_WRITE_INITIAL));
+                                unsafe { self.ring.submission().push(&sqe).map_err(|e| anyhow!("SQ full: {}", e))?; }
+                            } else {
+                                let next_chunk = std::cmp::min(self.buf_size, state.bytes_remaining as usize);
+                                let next_chunk = std::cmp::min(next_chunk, state.pipe.capacity);
+                                let sqe = opcode::Splice::new(
+                                    types::Fd(state.sock_fd), -1,
+                                    types::Fd(state.pipe.write_fd.as_raw_fd()), -1,
+                                    next_chunk as u32,
+                                ).build().user_data(encode_user_data(conn_id, STATE_SPLICE_IN));
+                                unsafe { self.ring.submission().push(&sqe).map_err(|e| anyhow!("SQ full: {}", e))?; }
+                            }
+                        } else {
+                            if state.header_bytes_read == state.header_buf.len() {
+                                state.header_buf.resize(state.header_buf.len() * 2, 0);
+                            }
+                            let sqe = opcode::Read::new(
+                                types::Fd(state.sock_fd),
+                                unsafe { state.header_buf.as_mut_ptr().add(state.header_bytes_read) },
+                                (state.header_buf.len() - state.header_bytes_read) as u32,
+                            ).build().user_data(encode_user_data(conn_id, STATE_READ_HEADER));
+                            unsafe { self.ring.submission().push(&sqe).map_err(|e| anyhow!("SQ full: {}", e))?; }
+                        }
+                    }
+                    STATE_WRITE_INITIAL => {
+                        let written = state.initial_payload_len as u64;
+                        state.file_offset += written;
+                        state.bytes_remaining = state.bytes_remaining.saturating_sub(written);
+                        total_downloaded_bytes += written;
+                        
+                        if state.bytes_remaining > 0 {
+                            let next_chunk = std::cmp::min(self.buf_size, state.bytes_remaining as usize);
+                            let next_chunk = std::cmp::min(next_chunk, state.pipe.capacity);
+                            let sqe = opcode::Splice::new(
+                                types::Fd(state.sock_fd), -1,
+                                types::Fd(state.pipe.write_fd.as_raw_fd()), -1,
+                                next_chunk as u32,
+                            ).build().user_data(encode_user_data(conn_id, STATE_SPLICE_IN));
+                            unsafe { self.ring.submission().push(&sqe).map_err(|e| anyhow!("SQ full: {}", e))?; }
+                        } else {
+                            if !state.done {
+                                state.done = true;
+                                active_connections -= 1;
+                            }
+                        }
+                    }
+                    STATE_SPLICE_IN => {
+                        state.current_pipe_bytes = res as u32;
+                        let sqe = opcode::Splice::new(
+                            types::Fd(state.pipe.read_fd.as_raw_fd()), -1,
+                            types::Fd(writer_fd), state.file_offset as i64,
+                            state.current_pipe_bytes,
+                        ).build().user_data(encode_user_data(conn_id, STATE_SPLICE_OUT));
+                        unsafe { self.ring.submission().push(&sqe).map_err(|e| anyhow!("SQ full: {}", e))?; }
+                    }
+                    STATE_SPLICE_OUT => {
+                        let written = res as u64;
+                        state.file_offset += written;
+                        state.bytes_remaining = state.bytes_remaining.saturating_sub(written);
+                        total_downloaded_bytes += written;
+                        
+                        let pct = (total_downloaded_bytes as f64 / total_size as f64) * 100.0;
+                        print!("\rProgress: {} / {} bytes ({:.2}%)", total_downloaded_bytes, total_size, pct);
+                        let _ = std::io::stdout().flush();
+                        
+                        if state.bytes_remaining > 0 {
+                            let next_chunk = std::cmp::min(self.buf_size, state.bytes_remaining as usize);
+                            let next_chunk = std::cmp::min(next_chunk, state.pipe.capacity);
+                            let sqe = opcode::Splice::new(
+                                types::Fd(state.sock_fd), -1,
+                                types::Fd(state.pipe.write_fd.as_raw_fd()), -1,
+                                next_chunk as u32,
+                            ).build().user_data(encode_user_data(conn_id, STATE_SPLICE_IN));
+                            unsafe { self.ring.submission().push(&sqe).map_err(|e| anyhow!("SQ full: {}", e))?; }
+                        } else {
+                            if !state.done {
+                                state.done = true;
+                                active_connections -= 1;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
             }
+            // re-submit all queued SQEs
+            self.ring.submit()?;
         }
-    }
-
-    fn submit_splice_in(&mut self, fd_in: i32, fd_out: i32, len: u32) -> Result<()> {
-        let sqe = opcode::Splice::new(
-            types::Fd(fd_in),
-            -1,
-            types::Fd(fd_out),
-            -1,
-            len,
-        )
-        .build()
-        .user_data(TAG_SPLICE_IN);
-
-        unsafe {
-            self.ring.submission().push(&sqe).map_err(|e| anyhow!("SQ full on splice in: {}", e))?;
-        }
-        self.ring.submit()?;
-        Ok(())
-    }
-
-    fn submit_splice_out(&mut self, fd_in: i32, fd_out: i32, off_out: u64, len: u32) -> Result<()> {
-        let sqe = opcode::Splice::new(
-            types::Fd(fd_in),
-            -1,
-            types::Fd(fd_out),
-            off_out as i64,
-            len,
-        )
-        .build()
-        .user_data(TAG_SPLICE_OUT);
-
-        unsafe {
-            self.ring.submission().push(&sqe).map_err(|e| anyhow!("SQ full on splice out: {}", e))?;
-        }
-        self.ring.submit()?;
+        
+        println!("\n🎉 Download complete via In-Kernel Zero-Copy Multi-Connection (splice)!");
         Ok(())
     }
 }
