@@ -1,6 +1,7 @@
 mod engine;
 mod http;
 mod storage;
+pub mod pipe;
 
 use anyhow::Result;
 use clap::Parser;
@@ -32,6 +33,10 @@ pub struct Cli {
     /// Buffer size per entry in bytes (default: 1048576 - 1 MiB)
     #[arg(long, default_value_t = 1048576)]
     pub buf_size: usize,
+
+    /// Number of concurrent connections to use (default: 16)
+    #[arg(short = 'x', long, default_value_t = 16)]
+    pub connections: usize,
 }
 
 fn main() -> Result<()> {
@@ -59,9 +64,10 @@ fn main() -> Result<()> {
     println!("Output: {:?}", output_path);
     println!("O_DIRECT Block Size: {} KiB", args.block_size_kb);
     println!("io_uring Buffer Ring Entries: {}", args.ring_entries);
+    println!("Concurrent Connections: {}", args.connections);
     println!("--------------------------------------------------");
 
-    let mut engine = DownloadEngine::new(args.ring_entries, args.buf_size, args.block_size_kb)?;
+    let mut engine = DownloadEngine::new(args.ring_entries, args.buf_size, args.connections, args.block_size_kb)?;
     engine.download(&parsed_url, &output_path)?;
 
     println!("✨ Finished successfully!");

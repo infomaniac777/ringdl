@@ -225,7 +225,9 @@ To prevent this, `ringdl` currently restricts `rustls` to **TLS 1.2**. This forc
    * Replaced the proposed global pipe pool with a 1-to-1 Kernel Pipe per connection architecture. Because `ringdl` targets 16-64 connections, kernel memory is comfortably bounded (16 MB - 64 MB) without requiring complex cross-connection pipe pooling.
 
 ### 8.2 Upcoming
-1. **IPv6 Support**:
+1. **Thorough Stability & Edge-Case Testing (TODO)**:
+   * The core MVP architecture is fully functional and delivers unprecedented performance. However, robust testing is needed for edge cases like flaky networks, HTTP 302 redirects, extremely large multi-terabyte files, and servers that lack `Content-Range` support.
+2. **IPv6 Support**:
    * Extend TCP socket resolution in `engine.rs` to handle `SocketAddr::V6`.
-2. **TLS 1.3 Support**:
+3. **TLS 1.3 Support**:
    * Investigate if TLS 1.3 `NewSessionTicket` control records can be safely bypassed or intercepted to allow upgrading from the current TLS 1.2 restriction.
