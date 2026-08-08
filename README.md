@@ -21,7 +21,7 @@ Once setup is complete, the download multiplexes concurrent sockets via `io_urin
 ```
 
 For each HTTP chunk:
-1. **`SPLICE_IN`**: `io_uring` executes `splice(2)`. The Linux kernel transparently decrypts the AES-GCM TLS records within the socket queue and transfers the `struct page *` memory references directly into a dedicated kernel pipe. *No physical payload bytes enter userspace.*
+1. **`SPLICE_IN`**: `io_uring` executes `splice(2)`. Transfers pages into a dedicated kernel pipe—by page reference under hardware TLS offload, or via a kernel-internal copy of decrypted pages under software fallback (see kTLS Implementation Details). *No physical payload bytes enter userspace.*
 2. **`SPLICE_OUT`**: `io_uring` executes another `splice(2)`, injecting those exact decrypted page references from the pipe straight into the destination file's Page Cache.
 
 ### kTLS Implementation Details
@@ -33,11 +33,14 @@ For each HTTP chunk:
 ### Methodology
 - **Kernel**: Linux 7.1.3 (Debian ARM64 Cloud)
 - **Architecture**: 6-core ARM64 virtualized (ARMv8 Crypto Extensions: `aes`, `pmull` active)
-- **Disk**: `/dev/vda1` (Virtual Block Storage)
-- **Network**: Local Docker bridge network (`172.18.0.x`), MTU 1500, with injected WAN simulation (50ms latency, 0.1% packet loss via `tc netem`).
+- **Disk**: `/dev/vda1` (Virtual Block Storage, `ext4`)
+- **Network**: Local Docker bridge network (`172.18.0.x`), MTU 1500, with injected WAN simulation (50ms latency, 0.1% packet loss via `tc netem`). Server (Nginx) and client are co-located on the same host.
 - **Test**: 1GB payload over HTTPS, 10 concurrent connections. Target Nginx server rigidly rate-limited to 100 Mbps per connection.
-- **aria2c command**: `aria2c -x 10 -s 10 -o aria2_bench.bin https://172.18.0.100:8443/test.bin`
-- **ringdl command**: `target/release/ringdl -x 10 https://172.18.0.100:8443/test.bin -o ringdl_bench.bin`
+- **Commands**:
+```bash
+aria2c -x 10 -s 10 -o aria2_bench.bin https://172.18.0.100:8443/test.bin
+target/release/ringdl -x 10 https://172.18.0.100:8443/test.bin -o ringdl_bench.bin
+```
 
 | Metric | `aria2c` | `ringdl` | Breakdown |
 | :--- | :--- | :--- | :--- |
@@ -48,7 +51,9 @@ For each HTTP chunk:
 | **Max RAM (RSS)** | 26.3 MB | **5.4 MB** | **79% Less RAM** |
 | **Page Faults** | 5,011 | **539** | **89% Fewer Faults** |
 
-*Transparency Note on CPU usage: `ringdl` is designed to have virtually zero userspace CPU overhead, but this explicitly comes at the cost of higher System (Kernel) CPU time. Because this benchmark runs in a virtualized environment without hardware TLS offloading, the kernel is forced to perform AES-GCM software decryption and memory allocation for every packet before splicing it to disk.*
+**Results:** single representative run; multi-run study with variance analysis pending (see Roadmap).
+
+*Transparency Note on CPU usage: `ringdl` is designed to have virtually zero userspace CPU overhead, but this explicitly comes at the cost of higher System (Kernel) CPU time. Because this benchmark runs in a virtualized environment without hardware TLS offloading, the kernel is forced to perform AES-GCM software decryption and memory allocation for every packet before splicing it to disk. Furthermore, because the target Nginx server is co-located on the same VM, the CPU is performing AES-GCM encryption for the server and decryption for the client simultaneously.*
 
 ## Usage
 
