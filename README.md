@@ -30,7 +30,7 @@ For each HTTP chunk:
 - **Kernel**: Linux 7.1.3 (Debian ARM64 Cloud)
 - **Architecture**: ARM64 virtualized
 - **Disk**: `/dev/vda1` (Virtual Block Storage)
-- **Network**: Local Docker bridge network (`172.18.0.x`), MTU 1500, simulating a 1Gbps environment.
+- **Network**: Local Docker bridge network (`172.18.0.x`), MTU 1500.
 - **Test**: 1GB payload over HTTPS, 10 concurrent connections. Target Nginx server rigidly rate-limited to 100 Mbps per connection.
 - **aria2c command**: `aria2c -x 10 -s 10 -o aria2_bench.bin https://172.18.0.100:8443/test.bin`
 
@@ -61,6 +61,4 @@ target/release/ringdl -x 16 https://example.com/file.bin -o output.bin
 * `--ring-entries <N>`: Number of CQ/SQ completion ring entries (default: 128).
 
 ## Roadmap
-* **Thorough Stability & Edge-Case Testing (TODO)**: Test edge cases (flaky networks, HTTP 302 redirects, massive terabyte files, servers missing `Content-Range` support).
-* **IPv6 Support**: Extend socket resolution to handle `SocketAddr::V6`.
-* **TLS 1.3 Support**: Bypass or intercept `NewSessionTicket` control records to support TLS 1.3 without crashing the pure byte-stream `splice` pipeline.
+* **Thorough Performance Testing (TODO)**: Expand benchmarking and performance profiling against `aria2c` as a baseline across varied network conditions (latency, jitter, varying MTUs) to determine if this zero-copy architectural prototype warrants further development.
