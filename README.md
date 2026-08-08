@@ -25,15 +25,16 @@ For each HTTP chunk:
 2. **`SPLICE_OUT`**: `io_uring` executes another `splice(2)`, injecting those exact page references from the pipe straight into the destination file's Page Cache.
 
 ## Benchmark: `ringdl` vs `aria2c`
-*Tested downloading a 1GB file over HTTPS with 16 concurrent connections on a Linux dragster environment.*
+*Tested downloading a 1GB file over HTTPS with 10 concurrent connections (throttled to 100 Mbps per connection) on a Linux dragster environment.*
 
-| Metric | `aria2c` (16 connections) | `ringdl` (16 connections) | Improvement |
+| Metric | `aria2c` | `ringdl` | Breakdown |
 | :--- | :--- | :--- | :--- |
-| **User CPU Time** | 4.20s | **0.18s** | **95.7% Less CPU** |
-| **System (Kernel) CPU Time** | 4.82s | **0.04s** | **99.1% Less CPU** |
-| **Total CPU Time** | 9.02s | **0.22s** | **97.5% Less CPU** |
-| **Max RAM (RSS)** | 20.8 MB | **6.7 MB** | **67.0% Less Memory** |
-| **Page Faults** | 11,740 | **549** | **95.3% Fewer Faults** |
+| **Wall Clock Time** | 12.83s | **11.20s** | **12% Faster** |
+| **Total CPU (User + Sys)** | **2.05s** | 3.24s | `ringdl` uses more *overall* CPU, but... |
+| **User CPU Time** | 1.14s | 0.19s | ...`aria2c` spends its time in userspace. |
+| **System CPU Time** | 0.91s | 3.05s | ...`ringdl` delegates TLS decryption (kTLS) to the kernel! |
+| **Max RAM (RSS)** | 27.4 MB | **5.4 MB** | **80% Less RAM** |
+| **Page Faults** | 9,361 | **569** | **94% Fewer Faults** |
 
 ## Usage
 
