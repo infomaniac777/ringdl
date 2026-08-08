@@ -53,13 +53,15 @@ target/release/ringdl -x 10 https://172.18.0.100:8443/test.bin -o ringdl_bench.b
 
 **Results:** Median and IQR of N=10 runs with page caches dropped (`drop_caches=3`) between every run.
 
-### WAN Failure Analysis: The Impedance Mismatch
-Under rigorous N=10 statistical testing with 50ms latency and 0.1% packet loss, `ringdl` collapses compared to `aria2c`. While `ringdl` is exceptionally fast on a local network, it suffers from severe **TCP Receive Window Starvation** over a WAN. 
+### WAN Failure Analysis: The Impedance Mismatch & Pipelining Depth
+Under rigorous N=10 statistical testing with 50ms latency and 0.1% packet loss, `ringdl` degrades to ~0.46x the throughput of `aria2c`. While `ringdl` is exceptionally fast on a local network, it suffers from severe **TCP Receive Window Starvation** over a WAN.
 
-Fundamentally, Network I/O (governed by TCP congestion control) and File I/O (governed by disk controllers and page cache writeback) operate in entirely different latency domains. 
-1. `aria2c` allocates a massive 26MB userspace buffer. This buffer completely decouples the two domains. It acts as a shock absorber, aggressively draining the network socket even during disk I/O stalls, keeping the TCP window wide open for fast congestion control recovery.
-2. `ringdl` restricts its memory buffer to a maximum 1MB kernel pipe per connection (`F_SETPIPE_SZ`). When the disk controller stalls even slightly, the 1MB pipe fills instantly. `SPLICE_IN` blocks, the socket queue fills up, and the Linux TCP stack immediately shrinks the advertised receive window to zero. 
-3. This completely chokes the sender, ruining CUBIC's ability to recover from the 0.1% packet loss, resulting in extreme volatility (28s IQR) and double the download time.
+This failure stems from two interconnected architectural flaws in our zero-copy design:
+1. **The Sub-BDP Pipe Size**: At 100Mbps with a 100ms RTT, the Bandwidth-Delay Product (BDP) per connection is ~1.25MB. Because `ringdl` caps its kernel pipes at 1MB (`F_SETPIPE_SZ`), the intermediate buffer is mathematically smaller than the BDP. The pipeline cannot keep the advertised window fully open even *without* disk stalls.
+2. **Synchronous Pipelining Depth**: Even when we experimentally raised the kernel pipe limit to 16MB via `sysctl`, throughput did not recover. This is because our `io_uring` state machine ping-pongs a single operation at a time: it issues `SPLICE_IN`, waits for it to complete, and then issues `SPLICE_OUT`. While waiting for the disk write to complete, the network socket is ignored.
+3. **The Rubber Band Effect**: `aria2c` survives this because its 26MB userspace buffer decouples the network and disk domains. It acts as a shock absorber, aggressively draining the network socket even during disk I/O stalls. In `ringdl`, the synchronous depth of 1 means a 100ms disk stall translates instantly to a 100ms TCP stall, shrinking the receive window to zero and destroying CUBIC's packet loss recovery.
+
+*Conclusion:* A pure linear kernel pipeline is a dead end on WANs. To fix this, `ringdl` would need an asynchronous state machine that maintains an in-flight `SPLICE_IN` depth greater than the BDP, completely decoupled from `SPLICE_OUT` disk writes.
 
 *Transparency Note on CPU usage: `ringdl` is designed to have virtually zero userspace CPU overhead, but this explicitly comes at the cost of higher System (Kernel) CPU time. Because this benchmark runs in a virtualized environment without hardware TLS offloading, the kernel is forced to perform AES-GCM software decryption and memory allocation for every packet before splicing it to disk. Furthermore, because the target Nginx server is co-located on the same VM, the CPU is performing AES-GCM encryption for the server and decryption for the client simultaneously.*
 
