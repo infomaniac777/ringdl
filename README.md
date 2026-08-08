@@ -44,14 +44,23 @@ target/release/ringdl -x 10 https://172.18.0.100:8443/test.bin -o ringdl_bench.b
 
 | Metric | `aria2c` | `ringdl` | Breakdown |
 | :--- | :--- | :--- | :--- |
-| **Wall Clock Time** | 37.92s | **35.69s** | **Marginally Faster** (delta within run-to-run noise under randomized loss) |
-| **Total CPU (User + Sys)** | **3.24s** | 4.53s | `ringdl` uses more *overall* CPU, because... |
-| **User CPU Time** | 1.55s | 0.27s | ...`aria2c` spends its time in userspace. |
-| **System CPU Time** | 1.69s | 4.26s | ...`ringdl` delegates software TLS decryption to the kernel. |
-| **Max RAM (RSS)** | 26.3 MB | **5.4 MB** | **79% Less RAM** |
-| **Page Faults** | 5,011 | **539** | **89% Fewer Faults** |
+| **Wall Clock Time** | **31.11s** | 67.31s | **`aria2c` is 2.1x Faster** (See WAN Failure Analysis) |
+| **Wall Clock IQR** | **9.11s** | 28.21s | `ringdl` is highly unstable under packet loss |
+| **Total CPU (User + Sys)** | **3.54s** | 5.33s | `ringdl` uses more *overall* CPU, because... |
+| **User CPU Time** | 1.77s | 0.29s | ...`aria2c` spends its time in userspace. |
+| **System CPU Time** | 1.77s | 5.04s | ...`ringdl` delegates software TLS decryption to the kernel. |
+| **Max RAM (RSS)** | 26.8 MB | **5.4 MB** | **80% Less RAM** |
+| **Page Faults** | 5,061 | **548** | **89% Fewer Faults** |
 
-**Results:** single representative run; multi-run study with variance analysis pending (see Roadmap).
+**Results:** Median and IQR of N=10 runs with page caches dropped (`drop_caches=3`) between every run.
+
+### WAN Failure Analysis: The Impedance Mismatch
+Under rigorous N=10 statistical testing with 50ms latency and 0.1% packet loss, `ringdl` collapses compared to `aria2c`. While `ringdl` is exceptionally fast on a local network, it suffers from severe **TCP Receive Window Starvation** over a WAN. 
+
+Fundamentally, Network I/O (governed by TCP congestion control) and File I/O (governed by disk controllers and page cache writeback) operate in entirely different latency domains. 
+1. `aria2c` allocates a massive 26MB userspace buffer. This buffer completely decouples the two domains. It acts as a shock absorber, aggressively draining the network socket even during disk I/O stalls, keeping the TCP window wide open for fast congestion control recovery.
+2. `ringdl` restricts its memory buffer to a maximum 1MB kernel pipe per connection (`F_SETPIPE_SZ`). When the disk controller stalls even slightly, the 1MB pipe fills instantly. `SPLICE_IN` blocks, the socket queue fills up, and the Linux TCP stack immediately shrinks the advertised receive window to zero. 
+3. This completely chokes the sender, ruining CUBIC's ability to recover from the 0.1% packet loss, resulting in extreme volatility (28s IQR) and double the download time.
 
 *Transparency Note on CPU usage: `ringdl` is designed to have virtually zero userspace CPU overhead, but this explicitly comes at the cost of higher System (Kernel) CPU time. Because this benchmark runs in a virtualized environment without hardware TLS offloading, the kernel is forced to perform AES-GCM software decryption and memory allocation for every packet before splicing it to disk. Furthermore, because the target Nginx server is co-located on the same VM, the CPU is performing AES-GCM encryption for the server and decryption for the client simultaneously.*
 
