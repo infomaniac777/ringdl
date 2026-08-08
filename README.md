@@ -33,18 +33,20 @@ For each HTTP chunk:
 - **Kernel**: Linux 7.1.3 (Debian ARM64 Cloud)
 - **Architecture**: ARM64 virtualized
 - **Disk**: `/dev/vda1` (Virtual Block Storage)
-- **Network**: Local Docker bridge network (`172.18.0.x`), MTU 1500.
+- **Network**: Local Docker bridge network (`172.18.0.x`), MTU 1500, with injected WAN simulation (50ms latency, 0.1% packet loss via `tc netem`).
 - **Test**: 1GB payload over HTTPS, 10 concurrent connections. Target Nginx server rigidly rate-limited to 100 Mbps per connection.
 - **aria2c command**: `aria2c -x 10 -s 10 -o aria2_bench.bin https://172.18.0.100:8443/test.bin`
 
 | Metric | `aria2c` | `ringdl` | Breakdown |
 | :--- | :--- | :--- | :--- |
-| **Wall Clock Time** | 12.83s | **11.20s** | **12% Faster** |
-| **Total CPU (User + Sys)** | **2.05s** | 3.24s | `ringdl` uses more *overall* CPU, but... |
-| **User CPU Time** | 1.14s | 0.19s | ...`aria2c` spends its time in userspace. |
-| **System CPU Time** | 0.91s | 3.05s | ...`ringdl` delegates TLS decryption (kTLS) to the kernel! |
-| **Max RAM (RSS)** | 27.4 MB | **5.4 MB** | **80% Less RAM** |
-| **Page Faults** | 9,361 | **569** | **94% Fewer Faults** |
+| **Wall Clock Time** | 37.92s | **35.69s** | **5.8% Faster** (recovering from TCP loss faster) |
+| **Total CPU (User + Sys)** | **3.24s** | 4.53s | `ringdl` uses more *overall* CPU, because... |
+| **User CPU Time** | 1.55s | 0.27s | ...`aria2c` spends its time in userspace. |
+| **System CPU Time** | 1.69s | 4.26s | ...`ringdl` delegates software TLS decryption to the kernel. |
+| **Max RAM (RSS)** | 26.3 MB | **5.4 MB** | **79% Less RAM** |
+| **Page Faults** | 5,011 | **539** | **89% Fewer Faults** |
+
+*Transparency Note on CPU usage: `ringdl` is designed to have virtually zero userspace CPU overhead, but this explicitly comes at the cost of higher System (Kernel) CPU time. Because this benchmark runs in a virtualized environment without hardware TLS offloading, the kernel is forced to perform AES-GCM software decryption and memory allocation for every packet before splicing it to disk.*
 
 ## Usage
 
