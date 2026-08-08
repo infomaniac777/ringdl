@@ -11,7 +11,7 @@ Unlike `aria2c` or `curl`, which copy data through user-space buffers and `epoll
 ### 1. Control Plane (Setup & TLS)
 1. **Pre-flight & Handshake**: Resolves DNS, establishes TCP sockets, and negotiates TLS 1.2 via `rustls`.
 2. **kTLS Offload**: Symmetric session keys are passed into the Linux kernel (`setsockopt(SOL_TLS)`). The kernel takes over all AES-GCM decryption seamlessly.
-3. **Allocation**: Parses the HTTP headers to extract `Content-Range` and pre-allocates the exact disk space via `posix_fallocate()` to eliminate file fragmentation.
+3. **Allocation**: Parses the HTTP headers to extract `Content-Range` and pre-allocates the exact disk space via `posix_fallocate()` to minimize allocation overhead during the download.
 
 ### 2. Data Plane (io_uring + splice)
 Once setup is complete, the download multiplexes concurrent sockets via `io_uring` without relying on traditional `epoll` + read/write cycles. 
@@ -23,6 +23,9 @@ Once setup is complete, the download multiplexes concurrent sockets via `io_urin
 For each HTTP chunk:
 1. **`SPLICE_IN`**: `io_uring` executes `splice(2)`. The Linux kernel transparently decrypts the AES-GCM TLS records within the socket queue and transfers the `struct page *` memory references directly into a dedicated kernel pipe. *No physical payload bytes enter userspace.*
 2. **`SPLICE_OUT`**: `io_uring` executes another `splice(2)`, injecting those exact decrypted page references from the pipe straight into the destination file's Page Cache.
+
+### kTLS Hardware vs Software Offload
+*Note: While `ringdl` completely eliminates user-space memory copying, true end-to-end zero-copy requires a NIC with Hardware TLS Offload. In standard or virtualized environments (like this benchmark), the kernel must fallback to software AES-GCM decryption. This forces the kernel to allocate new pages and perform an internal memory copy from the encrypted `sk_buff` to the decrypted pipe. This trade-off drastically reduces userspace CPU overhead, but shifts the cryptographic and allocation burden heavily onto the System CPU.*
 
 ## Benchmark: `ringdl` vs `aria2c`
 
