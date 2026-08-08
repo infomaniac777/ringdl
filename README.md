@@ -1,8 +1,8 @@
 # ringdl — In-Kernel Zero-Copy Downloader
 
-`ringdl` is a hyper-optimized, single-threaded HTTP/HTTPS downloader for Linux. It achieves maximum theoretical download speeds with virtually zero CPU usage and page faults by leveraging `io_uring`, `splice(2)`, and Kernel TLS (`kTLS`).
+`ringdl` is a high-performance, Linux-native TLS-offloaded transfer engine designed for infrastructure use cases. It achieves maximum theoretical download speeds with virtually zero **userspace CPU overhead** and page faults by leveraging `io_uring`, `splice(2)`, and Kernel TLS (`kTLS`).
 
-Unlike `aria2c` or `curl`, which copy data through user-space buffers, `ringdl` orchestrates a **pure kernel-space data pipeline**, slicing data directly from the network socket into the disk controller.
+Unlike `aria2c` or `curl`, which copy data through user-space buffers and `epoll` loops, `ringdl` orchestrates a **pure kernel-space data pipeline**. It multiplexes concurrent connections directly via Submission/Completion Queues (SQ/CQ) to slice decrypted data straight from the network socket into the disk controller.
 
 ## The Zero-Copy Pipeline
 
@@ -14,18 +14,25 @@ Unlike `aria2c` or `curl`, which copy data through user-space buffers, `ringdl` 
 3. **Allocation**: Parses the HTTP headers to extract `Content-Range` and pre-allocates the exact disk space via `posix_fallocate()` to eliminate file fragmentation.
 
 ### 2. Data Plane (io_uring + splice)
-Once setup is complete, the download enters a single-threaded `io_uring` event loop driving a 5-stage async state machine, multiplexing multiple connections concurrently.
+Once setup is complete, the download multiplexes concurrent sockets via `io_uring` without relying on traditional `epoll` + read/write cycles. 
 
 ```text
-[NIC RX Queue] ==(splice)==> [Kernel Pipe] ==(splice)==> [Disk Page Cache]
+[NIC RX Queue] ==(kTLS Decrypt)==> [Kernel Pipe] ==(splice)==> [Disk Page Cache]
 ```
 
 For each HTTP chunk:
-1. **`SPLICE_IN`**: `io_uring` executes `splice(2)`, transferring `struct page *` memory references directly from the TCP receive queue (`sk_buff`) into a dedicated 1 MB kernel pipe. *No physical payload bytes are copied.*
-2. **`SPLICE_OUT`**: `io_uring` executes another `splice(2)`, injecting those exact page references from the pipe straight into the destination file's Page Cache.
+1. **`SPLICE_IN`**: `io_uring` executes `splice(2)`. The Linux kernel transparently decrypts the AES-GCM TLS records within the socket queue and transfers the `struct page *` memory references directly into a dedicated kernel pipe. *No physical payload bytes enter userspace.*
+2. **`SPLICE_OUT`**: `io_uring` executes another `splice(2)`, injecting those exact decrypted page references from the pipe straight into the destination file's Page Cache.
 
 ## Benchmark: `ringdl` vs `aria2c`
-*Tested downloading a 1GB file over HTTPS with 10 concurrent connections (throttled to 100 Mbps per connection) on a Linux dragster environment.*
+
+### Methodology
+- **Kernel**: Linux 7.1.3 (Debian ARM64 Cloud)
+- **Architecture**: ARM64 virtualized
+- **Disk**: `/dev/vda1` (Virtual Block Storage)
+- **Network**: Local Docker bridge network (`172.18.0.x`), MTU 1500, simulating a 1Gbps environment.
+- **Test**: 1GB payload over HTTPS, 10 concurrent connections. Target Nginx server rigidly rate-limited to 100 Mbps per connection.
+- **aria2c command**: `aria2c -x 10 -s 10 -o aria2_bench.bin https://172.18.0.100:8443/test.bin`
 
 | Metric | `aria2c` | `ringdl` | Breakdown |
 | :--- | :--- | :--- | :--- |
