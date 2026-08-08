@@ -4,7 +4,7 @@
 
 Unlike `aria2c` or `curl`, which copy data through user-space buffers, `ringdl` orchestrates a **pure kernel-space data pipeline**, slicing data directly from the network socket into the disk controller.
 
-## 🚀 The Zero-Copy Pipeline
+## The Zero-Copy Pipeline
 
 `ringdl` operates in two phases: a synchronous **Control Plane** and a highly-concurrent, zero-copy **Data Plane**.
 
@@ -24,7 +24,7 @@ For each HTTP chunk:
 1. **`SPLICE_IN`**: `io_uring` executes `splice(2)`, transferring `struct page *` memory references directly from the TCP receive queue (`sk_buff`) into a dedicated 1 MB kernel pipe. *No physical payload bytes are copied.*
 2. **`SPLICE_OUT`**: `io_uring` executes another `splice(2)`, injecting those exact page references from the pipe straight into the destination file's Page Cache.
 
-## 🏎️ Benchmark: `ringdl` vs `aria2c`
+## Benchmark: `ringdl` vs `aria2c`
 *Tested downloading a 1GB file over HTTPS with 16 concurrent connections on a Linux dragster environment.*
 
 | Metric | `aria2c` (16 connections) | `ringdl` (16 connections) | Improvement |
@@ -35,7 +35,7 @@ For each HTTP chunk:
 | **Max RAM (RSS)** | 20.8 MB | **6.7 MB** | **67.0% Less Memory** |
 | **Page Faults** | 11,740 | **549** | **95.3% Fewer Faults** |
 
-## ⚙️ Usage
+## Usage
 
 ```bash
 # Build
@@ -52,7 +52,7 @@ target/release/ringdl -x 16 https://example.com/file.bin -o output.bin
 * `--buf-size <BYTES>`: Max splice chunk size per transaction (default: 1048576).
 * `--ring-entries <N>`: Number of CQ/SQ completion ring entries (default: 128).
 
-## 🗺️ Roadmap
+## Roadmap
 * **Thorough Stability & Edge-Case Testing (TODO)**: Test edge cases (flaky networks, HTTP 302 redirects, massive terabyte files, servers missing `Content-Range` support).
 * **IPv6 Support**: Extend socket resolution to handle `SocketAddr::V6`.
 * **TLS 1.3 Support**: Bypass or intercept `NewSessionTicket` control records to support TLS 1.3 without crashing the pure byte-stream `splice` pipeline.
