@@ -83,4 +83,7 @@ target/release/ringdl -x 16 https://example.com/file.bin -o output.bin
 * `--ring-entries <N>`: Number of CQ/SQ completion ring entries (default: 128).
 
 ## Roadmap
-* **Thorough Performance Testing (TODO)**: Expand benchmarking and performance profiling against `aria2c` as a baseline across varied network conditions (latency, jitter, varying MTUs) to determine if this zero-copy architectural prototype warrants further development.
+* **Deep-Pipeline Zero-Copy Redesign (TODO)**: Rewrite the `io_uring` state machine to fully decouple `SPLICE_IN` and `SPLICE_OUT`. A decoupled architecture can maintain a continuous in-flight pipeline depth greater than the connection's BDP (Bandwidth-Delay Product), effectively using kernel pipes as a massive shock absorber against disk writeback jitter.
+* **Hybrid Bounce Buffer Mode (TODO)**: Evaluate a hybrid design where a small userspace bounce buffer is implemented purely as a disk-side shock absorber for zero-copy transfers.
+* **Hardware kTLS Validation (TODO)**: Re-run performance benchmarks on a bare-metal NIC equipped with true hardware TLS offloading, to measure the exact CPU savings when the kernel doesn't have to perform AES-GCM software fallback.
+* **LAN/WAN Baseline Reporting (TODO)**: Restore the original LAN (0ms latency, 0% loss) benchmark table alongside the WAN results to fully contextualize the performance cliff.
