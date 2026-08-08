@@ -42,15 +42,14 @@ aria2c -x 10 -s 10 -o aria2_bench.bin https://172.18.0.100:8443/test.bin
 target/release/ringdl -x 10 https://172.18.0.100:8443/test.bin -o ringdl_bench.bin
 ```
 
-| Metric | `aria2c` | `ringdl` | Breakdown |
+| Metric | `aria2c` (Median ± IQR) | `ringdl` (Median ± IQR) | Breakdown |
 | :--- | :--- | :--- | :--- |
-| **Wall Clock Time** | **31.11s** | 67.31s | **`aria2c` is 2.1x Faster** (See WAN Failure Analysis) |
-| **Wall Clock IQR** | **9.11s** | 28.21s | `ringdl` is highly unstable under packet loss |
-| **Total CPU (User + Sys)** | **3.54s** | 5.33s | `ringdl` uses more *overall* CPU, because... |
-| **User CPU Time** | 1.77s | 0.29s | ...`aria2c` spends its time in userspace. |
-| **System CPU Time** | 1.77s | 5.04s | ...`ringdl` delegates software TLS decryption to the kernel. |
-| **Max RAM (RSS)** | 26.8 MB | **5.4 MB** | **80% Less RAM** |
-| **Page Faults** | 5,061 | **548** | **89% Fewer Faults** |
+| **Wall Clock Time** | **31.11s ± 9.11s** | 67.31s ± 28.21s | **`aria2c` is 2.1x Faster** (See WAN Failure Analysis) |
+| **Total CPU (User + Sys)** | **3.54s ± 0.78s** | 5.33s ± 0.95s | `ringdl` uses more *overall* CPU, because... |
+| **User CPU Time** | 1.77s ± 0.23s | 0.29s ± 0.03s | ...`aria2c` spends its time in userspace. |
+| **System CPU Time** | 1.77s ± 0.55s | 5.04s ± 0.92s | ...`ringdl` delegates software TLS decryption to the kernel. |
+| **Max RAM (RSS)** | 26.8 MB ± 0.7 MB | **5.4 MB ± 0.01 MB** | **80% Less RAM** |
+| **Page Faults** | 5,061 ± 522 | **548 ± 15** | **89% Fewer Faults** |
 
 **Results:** Median and IQR of N=10 runs with page caches dropped (`drop_caches=3`) between every run.
 
