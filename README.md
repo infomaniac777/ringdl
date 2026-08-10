@@ -87,8 +87,10 @@ target/release/ringdl -x 16 https://example.com/file.bin -o output.bin
 * `--buf-size <BYTES>`: Max splice chunk size per transaction (default: 1048576).
 * `--ring-entries <N>`: Number of CQ/SQ completion ring entries (default: 128).
 
-## Roadmap
-* **Deep-Pipeline Zero-Copy Redesign (DONE)**: Rewrote the `io_uring` state machine to fully decouple `SPLICE_IN` and `SPLICE_OUT`. A decoupled architecture maintains a continuous in-flight pipeline depth greater than the connection's BDP (Bandwidth-Delay Product), effectively using 16MB kernel pipes as a massive shock absorber against disk writeback jitter.
-* **Hybrid Bounce Buffer Mode (TODO)**: Evaluate a hybrid design where a small userspace bounce buffer is implemented purely as a disk-side shock absorber for zero-copy transfers.
-* **Hardware kTLS Validation (TODO)**: Re-run performance benchmarks on a bare-metal NIC equipped with true hardware TLS offloading, to measure the exact CPU savings when the kernel doesn't have to perform AES-GCM software fallback.
-* **LAN/WAN Baseline Reporting (TODO)**: Restore the original LAN (0ms latency, 0% loss) benchmark table alongside the WAN results to fully contextualize the performance cliff.
+## Roadmap: The "Go / No-Go" Testing Phase
+
+At this stage, the project's entire focus is on rigorous, unbiased testing to determine if the in-kernel zero-copy architecture provides a tangible, real-world advantage over highly-optimized userspace tools like `aria2c`. If `ringdl` cannot conclusively beat `aria2c` in a desirable metric (Total CPU efficiency, memory footprint, or raw throughput) under fair conditions, the project will be archived.
+
+* **Unbiased Alternating Benchmarks (TODO)**: Execute the rewritten benchmark suite that alternates `aria2c` and `ringdl` runs with strict 15-second idle cooldowns. This will mathematically isolate and eliminate the thermal throttling and CPU cache saturation biases seen in the previous sequential testing.
+* **Remote Server Validation (TODO)**: Move the target Nginx server to a physically separate machine to eliminate the extreme host-level CPU contention caused by the VM encrypting and decrypting the exact same packets simultaneously.
+* **Hardware kTLS Validation (TODO)**: Deploy and benchmark `ringdl` on a bare-metal server equipped with a NIC that supports true hardware TLS offloading (e.g., Mellanox ConnectX). This is the ultimate, critical test to determine if eliminating software AES-GCM kernel fallback allows `ringdl`'s Total CPU usage to drop significantly below `aria2c`.
