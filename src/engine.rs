@@ -40,13 +40,67 @@ struct ConnectionState {
     header_buf: Vec<u8>,
     header_bytes_read: usize,
     initial_payload_len: usize,
-    current_pipe_bytes: u32,
     
     // HTTP Request string to keep in memory for io_uring
     http_req: String,
     
     // Has this connection finished?
     done: bool,
+
+    // Bounded buffer accounting
+    pipe_bytes_available: usize,
+    inflight_in_bytes: usize,
+    inflight_out_bytes: usize,
+    
+    network_eof: bool,
+    disk_eof: bool,
+}
+
+fn submit_producer(ring: &mut IoUring, state: &mut ConnectionState, buf_size: usize) -> Result<()> {
+    if state.network_eof || state.inflight_in_bytes > 0 {
+        return Ok(());
+    }
+    
+    let pipe_space_free = state.pipe.capacity - state.pipe_bytes_available;
+    if pipe_space_free > 0 {
+        let mut max_read = std::cmp::min(pipe_space_free, state.bytes_remaining as usize);
+        max_read = std::cmp::min(max_read, buf_size);
+        
+        if max_read > 0 {
+            let sqe = opcode::Splice::new(
+                types::Fd(state.sock_fd), -1,
+                types::Fd(state.pipe.write_fd.as_raw_fd()), -1,
+                max_read as u32,
+            ).build().user_data(encode_user_data(state.id, STATE_SPLICE_IN));
+            
+            unsafe { ring.submission().push(&sqe).map_err(|e| anyhow!("SQ full: {}", e))?; }
+            state.inflight_in_bytes = max_read;
+        }
+    }
+    Ok(())
+}
+
+fn submit_consumer(ring: &mut IoUring, state: &mut ConnectionState, writer_fd: i32, buf_size: usize) -> Result<()> {
+    if state.disk_eof || state.inflight_out_bytes > 0 {
+        return Ok(());
+    }
+    
+    if state.pipe_bytes_available > 0 {
+        let mut max_write = state.pipe_bytes_available;
+        max_write = std::cmp::min(max_write, buf_size);
+        
+        if max_write > 0 {
+            let sqe = opcode::Splice::new(
+                types::Fd(state.pipe.read_fd.as_raw_fd()), -1,
+                types::Fd(writer_fd), state.file_offset as i64,
+                max_write as u32,
+            ).build().user_data(encode_user_data(state.id, STATE_SPLICE_OUT));
+            
+            unsafe { ring.submission().push(&sqe).map_err(|e| anyhow!("SQ full: {}", e))?; }
+            state.inflight_out_bytes = max_write;
+        }
+    }
+    Ok(())
 }
 
 pub struct DownloadEngine {
@@ -194,9 +248,13 @@ impl DownloadEngine {
                 header_buf: vec![0u8; 8192],
                 header_bytes_read: 0,
                 initial_payload_len: 0,
-                current_pipe_bytes: 0,
                 http_req,
                 done: false,
+                pipe_bytes_available: 0,
+                inflight_in_bytes: 0,
+                inflight_out_bytes: 0,
+                network_eof: false,
+                disk_eof: false,
             });
         }
         
@@ -251,22 +309,12 @@ impl DownloadEngine {
                                 unsafe { self.ring.submission().push(&sqe).map_err(|e| anyhow!("SQ full: {}", e))?; }
                             }
                             STATE_SPLICE_IN => {
-                                let next_chunk = std::cmp::min(self.buf_size, state.bytes_remaining as usize);
-                                let next_chunk = std::cmp::min(next_chunk, state.pipe.capacity);
-                                let sqe = opcode::Splice::new(
-                                    types::Fd(state.sock_fd), -1,
-                                    types::Fd(state.pipe.write_fd.as_raw_fd()), -1,
-                                    next_chunk as u32,
-                                ).build().user_data(user_data);
-                                unsafe { self.ring.submission().push(&sqe).map_err(|e| anyhow!("SQ full: {}", e))?; }
+                                state.inflight_in_bytes = 0;
+                                submit_producer(&mut self.ring, state, self.buf_size)?;
                             }
                             STATE_SPLICE_OUT => {
-                                let sqe = opcode::Splice::new(
-                                    types::Fd(state.pipe.read_fd.as_raw_fd()), -1,
-                                    types::Fd(writer_fd), state.file_offset as i64,
-                                    state.current_pipe_bytes,
-                                ).build().user_data(user_data);
-                                unsafe { self.ring.submission().push(&sqe).map_err(|e| anyhow!("SQ full: {}", e))?; }
+                                state.inflight_out_bytes = 0;
+                                submit_consumer(&mut self.ring, state, writer_fd, self.buf_size)?;
                             }
                             _ => {}
                         }
@@ -314,14 +362,17 @@ impl DownloadEngine {
                                 ).offset(state.file_offset as u64).build().user_data(encode_user_data(conn_id, STATE_WRITE_INITIAL));
                                 unsafe { self.ring.submission().push(&sqe).map_err(|e| anyhow!("SQ full: {}", e))?; }
                             } else {
-                                let next_chunk = std::cmp::min(self.buf_size, state.bytes_remaining as usize);
-                                let next_chunk = std::cmp::min(next_chunk, state.pipe.capacity);
-                                let sqe = opcode::Splice::new(
-                                    types::Fd(state.sock_fd), -1,
-                                    types::Fd(state.pipe.write_fd.as_raw_fd()), -1,
-                                    next_chunk as u32,
-                                ).build().user_data(encode_user_data(conn_id, STATE_SPLICE_IN));
-                                unsafe { self.ring.submission().push(&sqe).map_err(|e| anyhow!("SQ full: {}", e))?; }
+                                if state.bytes_remaining == 0 {
+                                    state.network_eof = true;
+                                    state.disk_eof = true;
+                                    if !state.done {
+                                        state.done = true;
+                                        active_connections -= 1;
+                                    }
+                                } else {
+                                    submit_producer(&mut self.ring, state, self.buf_size)?;
+                                    submit_consumer(&mut self.ring, state, writer_fd, self.buf_size)?;
+                                }
                             }
                         } else {
                             if state.header_bytes_read == state.header_buf.len() {
@@ -341,55 +392,52 @@ impl DownloadEngine {
                         state.bytes_remaining = state.bytes_remaining.saturating_sub(written);
                         total_downloaded_bytes += written;
                         
-                        if state.bytes_remaining > 0 {
-                            let next_chunk = std::cmp::min(self.buf_size, state.bytes_remaining as usize);
-                            let next_chunk = std::cmp::min(next_chunk, state.pipe.capacity);
-                            let sqe = opcode::Splice::new(
-                                types::Fd(state.sock_fd), -1,
-                                types::Fd(state.pipe.write_fd.as_raw_fd()), -1,
-                                next_chunk as u32,
-                            ).build().user_data(encode_user_data(conn_id, STATE_SPLICE_IN));
-                            unsafe { self.ring.submission().push(&sqe).map_err(|e| anyhow!("SQ full: {}", e))?; }
-                        } else {
+                        if state.bytes_remaining == 0 {
+                            state.network_eof = true;
+                            state.disk_eof = true;
                             if !state.done {
                                 state.done = true;
                                 active_connections -= 1;
                             }
+                        } else {
+                            submit_producer(&mut self.ring, state, self.buf_size)?;
+                            submit_consumer(&mut self.ring, state, writer_fd, self.buf_size)?;
                         }
                     }
                     STATE_SPLICE_IN => {
-                        state.current_pipe_bytes = res as u32;
-                        let sqe = opcode::Splice::new(
-                            types::Fd(state.pipe.read_fd.as_raw_fd()), -1,
-                            types::Fd(writer_fd), state.file_offset as i64,
-                            state.current_pipe_bytes,
-                        ).build().user_data(encode_user_data(conn_id, STATE_SPLICE_OUT));
-                        unsafe { self.ring.submission().push(&sqe).map_err(|e| anyhow!("SQ full: {}", e))?; }
+                        let bytes_read = res as usize;
+                        state.pipe_bytes_available += bytes_read;
+                        state.inflight_in_bytes = 0;
+                        
+                        state.bytes_remaining = state.bytes_remaining.saturating_sub(bytes_read as u64);
+                        if state.bytes_remaining == 0 {
+                            state.network_eof = true;
+                        }
+                        
+                        submit_producer(&mut self.ring, state, self.buf_size)?;
+                        submit_consumer(&mut self.ring, state, writer_fd, self.buf_size)?;
                     }
                     STATE_SPLICE_OUT => {
-                        let written = res as u64;
-                        state.file_offset += written;
-                        state.bytes_remaining = state.bytes_remaining.saturating_sub(written);
-                        total_downloaded_bytes += written;
+                        let bytes_written = res as usize;
+                        state.pipe_bytes_available -= bytes_written;
+                        state.inflight_out_bytes = 0;
+                        
+                        state.file_offset += bytes_written as u64;
+                        total_downloaded_bytes += bytes_written as u64;
                         
                         let pct = (total_downloaded_bytes as f64 / total_size as f64) * 100.0;
                         print!("\rProgress: {} / {} bytes ({:.2}%)", total_downloaded_bytes, total_size, pct);
                         let _ = std::io::stdout().flush();
                         
-                        if state.bytes_remaining > 0 {
-                            let next_chunk = std::cmp::min(self.buf_size, state.bytes_remaining as usize);
-                            let next_chunk = std::cmp::min(next_chunk, state.pipe.capacity);
-                            let sqe = opcode::Splice::new(
-                                types::Fd(state.sock_fd), -1,
-                                types::Fd(state.pipe.write_fd.as_raw_fd()), -1,
-                                next_chunk as u32,
-                            ).build().user_data(encode_user_data(conn_id, STATE_SPLICE_IN));
-                            unsafe { self.ring.submission().push(&sqe).map_err(|e| anyhow!("SQ full: {}", e))?; }
-                        } else {
+                        if state.network_eof && state.pipe_bytes_available == 0 {
+                            state.disk_eof = true;
                             if !state.done {
                                 state.done = true;
                                 active_connections -= 1;
                             }
+                        } else {
+                            submit_producer(&mut self.ring, state, self.buf_size)?;
+                            submit_consumer(&mut self.ring, state, writer_fd, self.buf_size)?;
                         }
                     }
                     _ => {}
