@@ -61,8 +61,14 @@ To fix this, `ringdl` now uses a completely decoupled, asynchronous state machin
 2. **Consumer Loop**: Drains the pipe to disk (`SPLICE_OUT`) independently.
 3. **16MB Bounded Buffer**: By leveraging a strict 16MB kernel pipe size limit (`F_SETPIPE_SZ`), the pipe acts as a massive shock absorber. It keeps the TCP Receive Window fully open even during multi-millisecond disk stalls, allowing CUBIC to properly recover from packet loss.
 
+### CPU Contention & Benchmark Bias Analysis
 
-*Transparency Note on CPU usage: `ringdl` is designed to have virtually zero userspace CPU overhead, but this explicitly comes at the cost of higher System (Kernel) CPU time. Because this benchmark runs in a virtualized environment without hardware TLS offloading, the kernel is forced to perform AES-GCM software decryption and memory allocation for every packet before splicing it to disk. Furthermore, because the target Nginx server is co-located on the same VM, the CPU is performing AES-GCM encryption for the server and decryption for the client simultaneously.*
+The severe spike in `ringdl`'s System CPU usage (93.16s vs `aria2c`'s 21.43s) and the high Wall Clock variance (IQR of 102.97s) indicate significant host-level contention in this specific VM setup. We suspect two major factors are skewing these metrics:
+
+1. **kTLS Page Allocation Penalty:** The high System CPU time is not due to kernel AES-GCM math being slower than OpenSSL (both utilize hardware acceleration like ARM CE or AES-NI). Instead, the bottleneck is the memory allocation penalty in the software kTLS fallback path. Because `ringdl` uses `splice(2)`, the kernel cannot decrypt the incoming `sk_buff` in-place. It is forced to dynamically allocate new kernel memory pages for the plaintext, decrypt into them, and then `splice` those pages. This constant page allocation overhead is highly expensive on System CPU compared to `aria2c`, which simply decrypts directly into a static, pre-allocated userspace buffer.
+2. **Sequential/Thermal Bias:** The N=10 benchmark executed 100 GB of `aria2c` traffic, immediately followed by 100 GB of `ringdl` traffic without cooldowns. Given that the target Nginx server is co-located on the same VM, the host CPU was forced to perform both AES-GCM encryption (for the server) and decryption (for the client) continuously. This sustained load likely induced thermal throttling and severe CPU cache saturation during the later `ringdl` runs, artificially inflating its System CPU time and inducing the extreme scheduling jitter (IQR 102s).
+
+Future benchmarks should alternate runs (`aria2c` -> `ringdl` -> `aria2c`) with enforced idle cooldowns to validate these suspicions and eliminate sequential bias.
 
 ## Usage
 
