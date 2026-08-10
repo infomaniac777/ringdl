@@ -42,14 +42,16 @@ aria2c -x 4 -s 4 -o aria2_bench.bin https://172.18.0.100:8443/test.bin
 target/release/ringdl -x 4 https://172.18.0.100:8443/test.bin -o ringdl_bench.bin
 ```
 
-| Metric | `aria2c` | `ringdl` (Decoupled) | Breakdown |
+| Metric | `aria2c` (Median ± IQR) | `ringdl` Decoupled (Median ± IQR) | Breakdown |
 | :--- | :--- | :--- | :--- |
-| **Wall Clock Time** | 4:10.14 | **3:58.28** | `ringdl` is now **faster**! (The kernel pipe shock absorber works) |
-| **Total CPU (User + Sys)** | 32.65s | **27.00s** | `ringdl` uses **17% less total CPU**! |
-| **User CPU Time** | 18.31s | **1.11s** | `ringdl` uses **94% less** userspace CPU. |
-| **System CPU Time** | 14.34s | 25.89s | Expected kTLS software fallback overhead. |
-| **Max RAM (RSS)** | 21.0 MB | **5.4 MB** | **74% Less RAM** |
-| **Page Faults** | 35,151 | **1,089** | **97% Fewer Faults** |
+| **Wall Clock Time** | **262.61s ± 2.71s** | 267.22s ± 102.97s | Decoupled `ringdl` essentially **matches** `aria2c` throughput! |
+| **Total CPU (User + Sys)** | **48.11s** (Approx) | 96.06s (Approx) | `ringdl` uses more *overall* CPU, because... |
+| **User CPU Time** | 26.68s ± 1.04s | **2.90s ± 1.41s** | ...`ringdl` uses **89% less** userspace CPU. |
+| **System CPU Time** | **21.43s ± 1.30s** | 93.16s ± 42.07s | ...`ringdl` delegates software TLS decryption to the kernel. |
+| **Max RAM (RSS)** | 20.7 MB ± 0.6 MB | **5.4 MB ± 0.1 MB** | **74% Less RAM** |
+| **Page Faults** | 29,292 ± 32,869 | **575 ± 35** | **98% Fewer Faults** |
+
+**Results:** Median and IQR of N=10 runs for a 10 GB file with page caches dropped (`drop_caches=3`) between every run.
 
 ### WAN Architecture Success: Decoupled io_uring Pipeline
 Originally, a pure linear kernel pipeline was a dead end on WANs because it ping-ponged operations sequentially (`SPLICE_IN` then `SPLICE_OUT`), which coupled disk latency tightly to network latency, causing TCP Window Starvation.
