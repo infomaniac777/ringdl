@@ -75,15 +75,15 @@ In earlier sequential tests, `ringdl` exhibited massive Wall Clock variance (IQR
 # Build
 cargo build --release
 
-# Download a file using 16 concurrent connections
-target/release/ringdl -x 16 https://example.com/file.bin -o output.bin
+# Download a file using 16 concurrent connections with the optimal 16KB TLS buffer
+target/release/ringdl -x 16 --buf-size 16384 https://example.com/file.bin -o output.bin
 ```
 
 ### CLI Arguments
 * `url`: Target HTTP/HTTPS URL.
 * `-x, --connections <N>`: Concurrent HTTP Range connections (default: 16).
 * `-o, --output <PATH>`: Output file path.
-* `--buf-size <BYTES>`: Max splice chunk size per transaction (default: 1048576).
+* `--buf-size <BYTES>`: Max splice chunk size per transaction (default: 1048576, recommended: 16384 for TLS offload).
 * `--ring-entries <N>`: Number of CQ/SQ completion ring entries (default: 128).
 
 ## Roadmap: The "Go / No-Go" Testing Phase
