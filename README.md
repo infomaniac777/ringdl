@@ -86,10 +86,12 @@ target/release/ringdl -x 16 --buf-size 16384 https://example.com/file.bin -o out
 * `--buf-size <BYTES>`: Max splice chunk size per transaction (default: 1048576, recommended: 16384 for TLS offload).
 * `--ring-entries <N>`: Number of CQ/SQ completion ring entries (default: 128).
 
-## Roadmap: The "Go / No-Go" Testing Phase
+## MVP Status: Archived
 
-At this stage, the project's entire focus is on rigorous, unbiased testing to determine if the in-kernel zero-copy architecture provides a tangible, real-world advantage over highly-optimized userspace tools like `aria2c`. If `ringdl` cannot conclusively beat `aria2c` in a desirable metric (Total CPU efficiency, memory footprint, or raw throughput) under fair conditions, the project will be archived.
+After rigorous, unbiased N=10 benchmarking against `aria2c`, the decision has been made to formally halt MVP development and archive the project. 
 
-* **Unbiased Alternating Benchmarks (DONE)**: Executed a strict alternating benchmark suite with 15-second idle cooldowns. This successfully eliminated the sequential hardware bias and proved that `ringdl` can maintain stable download throughput (IQR 10.99s).
-* **Remote Server Validation (TODO)**: Move the target Nginx server to a physically separate machine to eliminate the extreme host-level CPU contention caused by the VM encrypting and decrypting the exact same packets simultaneously.
-* **Hardware kTLS Validation (TODO)**: Deploy and benchmark `ringdl` on a bare-metal server equipped with a NIC that supports true hardware TLS offloading (e.g., Mellanox ConnectX). This is the ultimate, critical test to determine if eliminating software AES-GCM kernel fallback allows `ringdl`'s Total CPU usage to drop significantly below `aria2c`.
+While `ringdl` successfully proved the theoretical viability of a decoupled `io_uring` + `splice(2)` pipeline, and achieved a 74% reduction in RAM footprint alongside a 93% reduction in page faults, the absolute gains (saving ~15 MB of RAM) do not justify the severe computational cost. 
+
+Because `ringdl` relies on the Software kTLS fallback path in standard virtualized environments, the kernel is forced to dynamically allocate pages and perform internal AES-GCM math, resulting in a staggering **2x Total CPU Time** penalty (80s vs 38s) compared to `aria2c`'s highly-optimized userspace OpenSSL implementation.
+
+In modern cloud architecture, CPU cycles are drastically more expensive than a 15 MB memory overhead. Furthermore, as of August 2026, true Hardware kTLS Offloading is practically non-existent in typical consumer hardware and standard cloud instances. Because avoiding the severe software fallback penalty requires specialized enterprise NICs, developing this architecture for general-purpose use is a practical dead end. Until hardware offload becomes a ubiquitous commodity, the in-kernel zero-copy architecture cannot decisively beat highly-optimized userspace tools like `aria2c`.
