@@ -40,18 +40,29 @@ For each HTTP chunk:
 ```bash
 aria2c -x 4 -s 4 -o aria2_bench.bin https://172.18.0.100:8443/test.bin
 target/release/ringdl -x 4 --buf-size 16384 https://172.18.0.100:8443/test.bin -o ringdl_bench.bin
-```
+### 10 GB File Benchmark (Median of N=10)
 
-| Metric | `aria2c` (Median ± IQR) | `ringdl` Decoupled (Median ± IQR) | Breakdown |
-| :--- | :--- | :--- | :--- |
-| **Wall Clock Time** | **267.24s ± 7.34s** | 273.01s ± 10.99s | `aria2c` holds a very slight lead in raw speed over 50ms WAN. |
-| **Total CPU (User + Sys)** | **38.28s ± 0.92s** | 80.47s ± 5.00s | `ringdl` uses more *overall* CPU, because... |
-| **User CPU Time** | 21.44s ± 1.32s | **2.60s ± 0.20s** | ...`ringdl` uses **87% less** userspace CPU. |
-| **System CPU Time** | **16.81s ± 1.07s** | 77.85s ± 5.00s | ...`ringdl` delegates software TLS decryption to the kernel. |
-| **Max RAM (RSS)** | 20.7 MB ± 0.35 MB | **5.4 MB ± 0.12 MB** | **74% Less RAM** |
-| **Page Faults** | 11,208 ± 9,859 | **781 ± 449** | **93% Fewer Faults** |
+| Metric | `aria2c` | `ringdl` (16 KB Net / 1 MB Disk) |
+| :--- | :--- | :--- |
+| **Wall Clock Time** | **267.40s** | 272.76s |
+| **Total CPU (User + Sys)** | **37.11s** | 47.29s |
+| **User CPU Time** | 21.40s | **1.04s** |
+| **System CPU Time** | **15.89s** | 46.20s |
+| **Max RAM (RSS)** | 20.9 MB | **5.4 MB** |
+| **Page Faults** | 9,939 | **579** |
 
-**Results:** Median and IQR of N=10 interleaved runs (`aria2c` -> `ringdl` -> `aria2c`) with strict 15-second CPU cooldowns between every run to isolate hardware drift.
+### 1 GB File Benchmark (Median of N=10, Random Entropy)
+
+| Metric | `aria2c` | `ringdl` (16 KB Net / 1 MB Disk) |
+| :--- | :--- | :--- |
+| **Wall Clock Time** | **26.18s** | 27.77s |
+| **Total CPU (User + Sys)** | **3.57s** | 5.29s |
+| **User CPU Time** | 2.04s | **0.18s** |
+| **System CPU Time** | **1.56s** | 5.08s |
+| **Max RAM (RSS)** | 20.6 MB | **5.4 MB** |
+| **Page Faults** | 4,540 | **503** |
+
+**Results:** Both benchmarks used N=10 interleaved runs (`aria2c` -> `ringdl` -> `aria2c`) with strict 15-second CPU cooldowns between every run to isolate hardware drift. The `ringdl` parameters used were `--buf-size 16384` for the network `splice_in`, and a hardcoded 1 MB threshold for the disk `splice_out`.
 
 ### WAN Architecture Success: Decoupled io_uring Pipeline
 Originally, a pure linear kernel pipeline was a dead end on WANs because it ping-ponged operations sequentially (`SPLICE_IN` then `SPLICE_OUT`), which coupled disk latency tightly to network latency, causing TCP Window Starvation.
@@ -63,11 +74,11 @@ To fix this, `ringdl` now uses a completely decoupled, asynchronous state machin
 
 ### CPU Contention, Buffer Tuning, and True Variance
 
-In earlier sequential tests, `ringdl` exhibited massive Wall Clock variance (IQR of 102.97s) and even higher System CPU load (93s). By tuning the architecture and rigorously isolating the tests, we identified the true constraints:
+In earlier tests, `ringdl` exhibited massive Wall Clock variance and even higher System CPU load (77.85s). By tuning the architecture and rigorously isolating the tests, we identified the following optimizations and bottlenecks:
 
-1. **The 16 KB Buffer Fix (TLS Boundary Alignment):** Originally, `ringdl` requested 1 MB buffers via `splice()`. Because kTLS requires full TLS records (16 KB) to verify AES-GCM tags, requesting 1 MB forced the kernel into a brutal `try_to_wake_up` polling loop internally, hanging the kernel threads and inflating System CPU. By capping `--buf-size 16384` to match the exact TLS record boundary, `splice()` instantly returns to userspace upon record decryption. This entirely broke the kernel polling loop, dropping System CPU significantly.
-2. **Eliminating the Sequential Bias:** The N=10 Alternating Benchmark implemented strict 15-second idle cooldowns between every single tool run. This successfully mitigated external hardware factors (such as the VM encrypting and decrypting simultaneously) and completely stabilized `ringdl`'s download speed, dropping its Wall Clock IQR from **102.97s** down to a highly stable **10.99s**. Note: VM RAM was also increased from 2 GB to 4 GB during these tests, which may have marginally eased kernel `sk_buff` memory pressure.
-3. **The Final Software kTLS Penalty:** Even with the 16 KB fix and unbiased cooldowns, `ringdl` still consumes 77.85s of System CPU vs `aria2c`'s 16.81s. The bottleneck remains the dynamic kernel page allocations required for the software kTLS fallback path. Because `splice(2)` cannot decrypt the incoming `sk_buff` in-place, the kernel is forced to dynamically allocate new plaintext pages, decrypt into them, and then `splice` those pages.
+1. **The 16 KB Buffer Fix (TLS Boundary Alignment):** Originally, `ringdl` requested 1 MB network buffers via `splice()`. Because kTLS requires full TLS records (16 KB) to verify AES-GCM tags, asking for 64 KB or 1 MB stalled the kernel threads and caused the Wall Clock time to skyrocket. By perfectly aligning `--buf-size 16384` to match the exact TLS record boundary, the pipeline flows with zero stall latency.
+2. **The 1 MB Disk Write Threshold:** Originally, `ringdl` flushed to the disk page cache as soon as the 16 KB network payload arrived. This flooded the kernel with millions of micro-writes. By forcing the internal kernel pipe to buffer 1 MB before issuing a `splice_out` to the file, the System CPU overhead plummeted from 77.85s down to 46.20s.
+3. **The Degradation Hypothesis:** While a single isolated run of `ringdl` achieved a System Time of just 18.67s (nearly matching `aria2c`), the N=10 median skyrocketed to 46.20s over sustained load. We hypothesize that this is caused by severe kernel slab allocator fragmentation. Software kTLS must dynamically allocate fresh plaintext pages for every decrypted 16 KB chunk. `ringdl` then moves these pages into the kernel pipe, and finally into the Page Cache. Over 100 GB of continuous transfer, we suspect the cost of allocating, tracking, and freeing millions of small page references fragments the memory subsystem, causing the kernel to burn massive CPU cycles just managing the page pipeline.
 
 ## Usage
 
@@ -90,8 +101,8 @@ target/release/ringdl -x 16 --buf-size 16384 https://example.com/file.bin -o out
 
 After rigorous, unbiased N=10 benchmarking against `aria2c`, the decision has been made to formally halt MVP development and archive the project. 
 
-While `ringdl` successfully proved the theoretical viability of a decoupled `io_uring` + `splice(2)` pipeline, and achieved a 74% reduction in RAM footprint alongside a 93% reduction in page faults, the absolute gains (saving ~15 MB of RAM) do not justify the severe computational cost. 
+While `ringdl` successfully proved the theoretical viability of a decoupled `io_uring` + `splice(2)` pipeline, and achieved a 74% reduction in RAM footprint alongside a 94% reduction in page faults, the absolute gains (saving ~15 MB of RAM) do not justify the severe computational cost. 
 
-Because `ringdl` relies on the Software kTLS fallback path in standard virtualized environments, the kernel is forced to dynamically allocate pages and perform internal AES-GCM math, resulting in a staggering **2x Total CPU Time** penalty (80s vs 38s) compared to `aria2c`'s highly-optimized userspace OpenSSL implementation.
+Because `ringdl` relies on the Software kTLS fallback path in standard virtualized environments, the kernel is forced to dynamically allocate pages and perform internal AES-GCM math. Combined with the hypothesized page management overhead and fragmentation under sustained load, this results in a **27% Total CPU Time penalty** (47.29s vs 37.11s) compared to `aria2c`'s highly-optimized userspace copying.
 
-In modern cloud architecture, CPU cycles are drastically more expensive than a 15 MB memory overhead. Furthermore, as of August 2026, true Hardware kTLS Offloading is practically non-existent in typical consumer hardware and standard cloud instances. Because avoiding the severe software fallback penalty requires specialized enterprise NICs, developing this architecture for general-purpose use is a practical dead end. Until hardware offload becomes a ubiquitous commodity, the in-kernel zero-copy architecture cannot decisively beat highly-optimized userspace tools like `aria2c`.
+In modern cloud architecture, CPU cycles are drastically more expensive than a 15 MB memory overhead. Until Hardware kTLS Offload becomes a ubiquitous commodity on consumer and standard cloud NICs, allowing true in-place decryption without page shuffling, the in-kernel zero-copy architecture cannot decisively beat highly-optimized userspace tools like `aria2c`.
