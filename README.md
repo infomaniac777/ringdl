@@ -51,7 +51,7 @@ target/release/ringdl -x 4 --buf-size 16384 https://172.18.0.100:8443/test.bin -
 | **Max RAM (RSS)** | 20.9 MB | **5.4 MB** |
 | **Page Faults** | 9,939 | **579** |
 
-### 1 GB File Benchmark (Median of N=10, Random Entropy)
+### 1 GB File Benchmark (HTTPS / TLS, Random Entropy)
 
 | Metric | `aria2c` | `ringdl` (16 KB Net / 1 MB Disk) |
 | :--- | :--- | :--- |
@@ -61,6 +61,17 @@ target/release/ringdl -x 4 --buf-size 16384 https://172.18.0.100:8443/test.bin -
 | **System CPU Time** | **1.56s** | 5.08s |
 | **Max RAM (RSS)** | 20.6 MB | **5.4 MB** |
 | **Page Faults** | 4,540 | **503** |
+
+### 1 GB File Benchmark (HTTP / Non-TLS, Random Entropy)
+
+| Metric | `aria2c` | `ringdl` (16 KB Net / 1 MB Disk) |
+| :--- | :--- | :--- |
+| **Wall Clock Time** | **24.52s** | 25.21s |
+| **Total CPU (User + Sys)** | **2.44s** | 3.47s |
+| **User CPU Time** | 0.54s | **0.07s** |
+| **System CPU Time** | **1.90s** | 3.37s |
+| **Max RAM (RSS)** | 20.5 MB | **3.1 MB** |
+| **Page Faults** | 3,031 | **178** |
 
 **Results:** Both benchmarks used N=10 interleaved runs (`aria2c` -> `ringdl` -> `aria2c`) with strict 15-second CPU cooldowns between every run to isolate hardware drift. The `ringdl` parameters used were `--buf-size 16384` for the network `splice_in`, and a hardcoded 1 MB threshold for the disk `splice_out`.
 
