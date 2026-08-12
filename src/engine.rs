@@ -85,9 +85,10 @@ fn submit_consumer(ring: &mut IoUring, state: &mut ConnectionState, writer_fd: i
         return Ok(());
     }
     
-    if state.pipe_bytes_available > 0 {
+    let disk_buf_size = 1048576; // 1 MB chunks for efficient disk writes
+    if state.pipe_bytes_available >= disk_buf_size || (state.network_eof && state.pipe_bytes_available > 0) {
         let mut max_write = state.pipe_bytes_available;
-        max_write = std::cmp::min(max_write, buf_size);
+        max_write = std::cmp::min(max_write, disk_buf_size);
         
         if max_write > 0 {
             let sqe = opcode::Splice::new(
