@@ -110,10 +110,13 @@ target/release/ringdl -x 16 --buf-size 16384 https://example.com/file.bin -o out
 
 ## MVP Status: Archived
 
-After rigorous, unbiased N=10 benchmarking against `aria2c`, the decision has been made to formally halt MVP development and archive the project. 
+After rigorous, unbiased N=10 benchmarking across both TLS and pure HTTP constraints, the decision has been made to formally halt MVP development and archive the project for now. 
 
-While `ringdl` successfully proved the theoretical viability of a decoupled `io_uring` + `splice(2)` pipeline, and achieved a 74% reduction in RAM footprint alongside a 94% reduction in page faults, the absolute gains (saving ~15 MB of RAM) do not justify the severe computational cost. 
+While `ringdl` successfully proved the theoretical viability of a decoupled `io_uring` + `splice(2)` pipeline, and achieved a massive 74% reduction in RAM footprint alongside a 94% reduction in page faults, the absolute gains do not justify the severe computational cost. 
 
-Because `ringdl` relies on the Software kTLS fallback path in standard virtualized environments, the kernel is forced to dynamically allocate pages and perform internal AES-GCM math. Combined with the hypothesized page management overhead and fragmentation under sustained load, this results in a **27% Total CPU Time penalty** (47.29s vs 37.11s) compared to `aria2c`'s highly-optimized userspace copying.
+Because `ringdl` relies on the Software kTLS fallback path in standard virtualized environments, the kernel is forced to dynamically allocate pages and perform internal AES-GCM math. More importantly, even in pure HTTP control tests without encryption, forcing the kernel to handle tens of thousands of strict 16 KB `splice` system calls still resulted in higher System CPU usage than `aria2c`'s highly-optimized userspace memory copying. 
 
-In modern cloud architecture, CPU cycles are drastically more expensive than a 15 MB memory overhead. Until Hardware kTLS Offload becomes a ubiquitous commodity on consumer and standard cloud NICs, allowing true in-place decryption without page shuffling, the in-kernel zero-copy architecture cannot decisively beat highly-optimized userspace tools like `aria2c`.
+It seems there is either vastly more hyperparameter tuning required, or there is a fundamental structural bottleneck in the Linux kernel's handling of micro-splices and page allocations under sustained load. 
+
+**Future Work:** 
+Any future endeavors looking to resurrect this architecture should start with exhaustive hyperparameter tuning—focusing specifically on decoupled network buffer sizes and disk write thresholds—before attempting to optimize the I/O state machine further. Until then, the in-kernel zero-copy architecture cannot decisively beat highly-optimized userspace tools like `aria2c`.
