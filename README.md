@@ -40,6 +40,7 @@ For each HTTP chunk:
 ```bash
 aria2c -x 4 -s 4 -o aria2_bench.bin https://172.18.0.100:8443/test.bin
 target/release/ringdl -x 4 --buf-size 16384 https://172.18.0.100:8443/test.bin -o ringdl_bench.bin
+```
 ### 10 GB File Benchmark (Median of N=10)
 
 | Metric | `aria2c` | `ringdl` (16 KB Net / 1 MB Disk) |
